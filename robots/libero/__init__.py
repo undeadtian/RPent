@@ -1,4 +1,16 @@
-"""LIBERO environment extension."""
+"""LIBERO 对 RPent 环境插件协议的具体实现。
+
+``rpent.envs.base`` 动态导入本模块后，通过 ``get_env_spec`` 取得以下 hook：
+
+- ``_add_cli_args``：注册 suite/task/seed、服务 endpoint 和 CUDA 参数；
+- ``_parse_config``：生成 recipe_tag、输出目录和 Prompt 变量；
+- ``_init_runtime``：普通 CLI 一次性启动 env/VLA/SAM3；
+- ``init_shared_runtime`` + ``init_task_runtime``：Dashboard 拆分的生命周期；
+- ``get_toolkit``：用运行时返回的 RPC clients 构造 ``LiberoToolkit``。
+
+本模块是通用 CLI 与 LIBERO 实现的边界。重型仿真、RPC 和模型依赖均在 hook 内延迟
+导入，单纯枚举环境或构建 argparse 时不会加载 MuJoCo、RLinf 或 CUDA 模型。
+"""
 from __future__ import annotations
 
 import argparse
@@ -412,10 +424,14 @@ def _init_runtime(
         raise
 
     # --- vla_server --------------------------------------------------------
+    # VLA 服务是独立的长生命周期推理进程，只负责“观测 -> Pi0.5 动作块”。
+    # 环境执行仍在 env_server 中，因此模型服务可以远端部署或跨任务复用。
     dashboard_events.emit(RuntimeStatusEvent("vla", "starting"))
     try:
         vla_daemon: ProcessDaemon | None = None
         if args.vla_endpoint is None:
+            # 未提供 endpoint：选择本机空闲端口并由当前运行拥有该子进程。最终清理
+            # 时只有 daemons 中的本地服务会被停止，外部服务绝不会被误关闭。
             host, port = "127.0.0.1", pick_free_port()
             vla_daemon = ProcessDaemon(
                 name="vla_server",
@@ -425,7 +441,10 @@ def _init_runtime(
                     "--transport", "http",
                     "--host", host,
                     "--port", str(port),
+                    # 父进程异常退出、stdin pipe 关闭时，服务端自行终止，避免遗留
+                    # 占用 GPU 显存的孤儿模型进程。
                     "--parent-watch",
+                    # --cuda-device 在子进程第一次构造 CUDA 模型前设置可见 GPU。
                     *cuda_args,
                 ],
                 env=_subprocess_env(),
@@ -433,8 +452,12 @@ def _init_runtime(
             )
             vla_daemon.start()
             daemons.append(vla_daemon)
+
+            # 这里只创建轻量传输客户端；模型仍在 vla_server 子进程中加载。
             vla_rpc: RpcClient = HttpRpcClient(f"http://{host}:{port}")
         else:
+            # 提供 endpoint：不启动、不拥有远端服务，只按协议构造客户端。省略协议
+            # 时 parse_endpoint 默认使用 HTTP。
             protocol, host, port = parse_endpoint(args.vla_endpoint)
             if protocol == "socket":
                 vla_rpc = SocketRpcClient(host, port)
@@ -445,6 +468,7 @@ def _init_runtime(
                     f"--vla-endpoint protocol must be socket or http, got {protocol!r}"
                 )
     except Exception as exc:
+        # 将启动/endpoint 解析错误同步给 Dashboard，然后让上层统一清理已启动服务。
         dashboard_events.emit(RuntimeStatusEvent("vla", "failed", error=exc))
         raise
 

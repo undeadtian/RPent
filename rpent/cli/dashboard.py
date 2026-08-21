@@ -1,4 +1,14 @@
-"""CLI orchestration for one long-lived Dashboard Session."""
+"""``--dashboard`` 分支的长生命周期 Session 编排器。
+
+普通 ``cli.main`` 一次只运行一个任务；Dashboard 则提前接管控制流，并把生命周期
+拆成两层：
+
+- Session 级：启动一次可复用的 VLA/SAM3 服务和 Web Dashboard；
+- TaskRun 级：每次用户提交任务都创建全新的 env_server、Toolkit、Planner 和输出目录。
+
+任务按顺序执行，避免多个 Agent 同时控制共享资源。每个 TaskRun 仍沿用普通 CLI 的
+核心步骤：``parse_config -> get_toolkit -> build_planner -> solve -> cleanup``。
+"""
 
 from __future__ import annotations
 

@@ -99,29 +99,54 @@ class LiberoPrimitives:
             self.record_frame(obs)
 
     def _vlm_chunk(self, instruction: str):
-        """One model forward + ``chunk_size`` env steps. Overrides prompt."""
+        """执行一次 VLA 前向，并把返回的整个动作块推进到环境中。
+
+        这是 primitive 层与 VLA RPC 层的唯一直接交界点：输入是当前单环境观测
+        和一个局部子指令，``VLAClient`` 返回 ``[chunk, 7]`` 动作，随后
+        ``LiberoEnvClient.chunk_step`` 顺序执行这些动作并返回最终观测。
+
+        方法名保留了早期的 ``vlm`` 命名，但这里调用的是能够输出动作的 VLA。
+        """
+        # 取消只在安全边界检查：不要在模型请求已经发出或环境动作块执行到一半时
+        # 无条件破坏共享状态。
         self._check_cancelled()
         original_task = self._last_obs.get("task_descriptions")
         try:
+            # 顶层任务语言描述完整任务；每个 VLA primitive 可以临时覆盖为更局部的
+            # 接触指令，例如“抓住黑色碗”。finally 会恢复原始任务描述。
             self._last_obs["task_descriptions"] = instruction
+
+            # VLA/OpenPI 的观测处理器要求该键始终存在，即使当前没有额外视角。
             self._last_obs.setdefault("extra_view_images", None)
 
-            actions, _ = self.model.predict_action_batch(self._last_obs, mode="eval")
+            # VLAClient 在这里完成图像 PNG/base64 编码和 RPC；服务端执行 Pi0.5
+            # 前向，再把 [B=1, chunk, 7] 去掉 batch 维后返回。
+            actions, _ = self.model.predict_action_batch(
+                self._last_obs,
+                mode="eval",
+            )
             self._check_cancelled()
 
             if not self._recording:
-                chunk_obs,  _r, _t, _tr, _i = self.env.chunk_step(actions)
+                # 非录制模式允许环境客户端按配置只返回最终帧；若服务配置为返回
+                # 全部帧，则显式选择动作块执行后的最后一帧作为当前观测。
+                chunk_obs, _r, _t, _tr, _i = self.env.chunk_step(actions)
                 obs = chunk_obs[-1] if self.env.return_all_frames else chunk_obs
             else:
-                chunk_obs,  _r, _t, _tr, _i = self.env.chunk_step(
-                    actions, return_all_frames=True
+                # 录制模式必须拿到动作块内每一步的观测，才能生成连续 episode 视频。
+                chunk_obs, _r, _t, _tr, _i = self.env.chunk_step(
+                    actions,
+                    return_all_frames=True,
                 )
                 for obs in chunk_obs:
                     self.record_frame(obs)
                 obs = chunk_obs[-1]
+
+            # 后续成功判定和下一轮 VLA 前向都基于动作块结束后的最新状态。
             self.set_obs(obs)
             return self._last_obs
         finally:
+            # 局部 VLA 指令只在这次前向期间生效，不能污染全局任务描述。
             if original_task is not None:
                 self._last_obs["task_descriptions"] = original_task
 

@@ -1,4 +1,17 @@
-"""Interactive terminal input helpers for the Physical Agent CLI."""
+"""交互式 CLI 的终端输入、队列和首条 Prompt 并行准备工具。
+
+该模块不执行 Planner 或机器人动作，只管理输入通道：
+
+- ``start_interactive_reader`` 在 daemon thread 中运行 prompt-toolkit，把用户输入写入
+  ``queue.Queue``；
+- ``start_first_prompt_resolver`` 在另一线程提前消费首条任务，让主线程可同时加载
+  env/VLA/SAM3；
+- Planner 启动后继续从同一队列读取后续 steering 消息；
+- ``None`` sentinel 或 ``/quit`` 表示结束会话。
+
+由于 prompt-toolkit 会切换 TTY raw mode，本模块还注册退出恢复逻辑，避免主线程被
+Ctrl-C 中断时终端失去回显。
+"""
 from __future__ import annotations
 
 import atexit

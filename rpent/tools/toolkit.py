@@ -195,12 +195,21 @@ class Toolkit:
         )
 
     def execute_tool(self, name: str, input_dict: dict[str, Any]) -> ToolResult:
-        """Dispatch a tool call to its registered handler."""
+        """执行一个 Planner 工具调用，并统一处理串行化、异常和状态反馈。
+
+        对 VLA 路径而言，handler 最终会进入 ``LiberoPrimitives.pi0_*``，再经
+        ``VLAClient`` 调用模型服务。该方法本身与具体环境无关：它只负责找到
+        handler，并在动作结束后要求环境 Toolkit 捕获一份新的可观测状态。
+        """
+        # LLM 只能调用注册表中存在的 schema；未知名称作为普通工具错误返回，
+        # 不抛出到 Planner 外层，这样模型有机会修正工具名后继续任务。
         entry = self._tools.get(name)
         if entry is None:
             return ToolResult(name=name, result={"error": f"unknown tool: {name}"})
         _, handler = entry
 
+        # 一个 Toolkit 对应一个物理环境。禁止并发动作可避免两个模型工具同时推进
+        # 同一模拟器，也为 Dashboard 的取消操作提供唯一的 active operation。
         with self._operation_lock:
             if self._active_operation is not None:
                 return ToolResult(
@@ -214,14 +223,18 @@ class Toolkit:
             started = time.perf_counter()
             failed = False
             try:
+                # handler 可能是只读感知函数，也可能同步等待 VLA RPC 和一整个环境
+                # 动作块执行完毕；Planner 侧会在独立线程调用本方法，避免阻塞事件循环。
                 result = handler(**input_dict)
             except TypeError as e:
+                # 参数不符合 JSON schema/函数签名时，把实际输入回显给模型便于修正。
                 result = {
                     "error": f"bad arguments for {name}: {e}",
                     "got": input_dict,
                 }
                 failed = True
             except ToolCancelled as e:
+                # 取消是可恢复的工具结果，不应当作未捕获异常终止整个 Planner 会话。
                 result = {
                     "error": str(e),
                     "code": "tool_cancelled",
@@ -229,21 +242,27 @@ class Toolkit:
                 }
                 failed = True
             except Exception as e:
+                # RPC、环境或 primitive 异常也返回给模型；traceback 同时用于诊断。
                 result = {"error": str(e), "traceback": traceback.format_exc()}
                 failed = True
 
+            # 非 readonly 工具可能改变机器人/场景。无论 handler 成功还是失败，都要
+            # 尝试抓取执行后的真实状态，防止模型基于调用前图像继续规划。
             if not _is_readonly(handler):
                 elapsed_s = round(time.perf_counter() - started, 2)
                 result_dict = result if isinstance(result, dict) else {"value": result}
                 command = {"action": name, **input_dict}
                 record: StepRecord | None = None
                 try:
+                    # 具体保存哪些 RGB-D、世界坐标和机器人状态由环境子类实现。
                     captured = self.get_env_state(
                         command=command,
                         result=result_dict,
                         elapsed_s=elapsed_s,
                     )
                 except Exception as e:
+                    # 状态采集失败时仍保留 primitive 原结果，避免二次错误完全遮蔽
+                    # 首个执行结果。
                     captured = result_dict
                     captured["state_capture_error"] = str(e)
                     captured.setdefault(
@@ -253,14 +272,19 @@ class Toolkit:
                 else:
                     record = self._state.latest_record()
                 result = captured
+
+                # 若 handler 已失败，把原错误字段合并回状态快照；已有字段优先保留。
                 if failed:
                     for key, value in result_dict.items():
                         result.setdefault(key, value)
                 if record is not None:
                     self._publish_step(record)
 
+            # ToolResult 把 dict 转成 Planner 可消费的文本块和可选 base64 图像块。
             return ToolResult(name=name, result=result)
         finally:
+            # 即使 handler、状态采集或返回格式化异常，也必须释放 active operation，
+            # 否则后续所有工具都会被误判为“仍有工具执行中”。
             with self._operation_lock:
                 self._active_operation = None
                 operation.done_event.set()

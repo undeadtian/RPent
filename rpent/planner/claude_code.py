@@ -759,7 +759,16 @@ class _Recorder:
 
 
 def _build_rpent_server(sdk: Any, *, toolkit: Toolkit) -> Any:
+    """把 RPent 工具注册表转换为 Claude SDK 的进程内 MCP server。
+
+    这里不会启动额外 HTTP 服务。Claude Agent SDK 通过内存中的 MCP server 看到
+    ``mcp__rpent__<tool>``；每次模型工具调用最终仍落到同一个
+    ``toolkit.execute_tool``。因此 VLA、环境和状态记录都继续受 RPent 控制。
+    """
     sdk_tools = []
+
+    # Claude SDK 可能并发发起工具请求，但单个机器人环境只能串行推进。外层 MCP
+    # 桥先串行化请求，Toolkit 内部还有第二层锁作为跨 Planner 的通用保护。
     tool_execution_lock = asyncio.Lock()
     for spec in toolkit.get_tools_spec():
         name = str(spec["name"])
@@ -771,7 +780,11 @@ def _build_rpent_server(sdk: Any, *, toolkit: Toolkit) -> Any:
             *,
             tool_name: str = name,
         ) -> dict[str, Any]:
+            # ``tool_name=name`` 用默认参数冻结本轮循环变量，避免 Python 闭包晚绑定
+            # 导致所有 MCP handler 最终都调用最后一个工具。
             async with tool_execution_lock:
+                # primitive/RPC 是同步接口，放入工作线程，避免阻塞 Claude SDK 的
+                # asyncio 消息流和 Dashboard 交互。
                 result = await asyncio.to_thread(
                     toolkit.execute_tool,
                     tool_name,
@@ -779,15 +792,21 @@ def _build_rpent_server(sdk: Any, *, toolkit: Toolkit) -> Any:
                 )
             return _tool_result_to_mcp(result)
 
+        # 名称仅用于 SDK/日志诊断；真正公开的工具名仍来自 spec。
         run_tool.__name__ = f"rpent_{name}"
         sdk_tools.append(sdk.tool(name, description, input_schema)(run_tool))
 
-    return sdk.create_sdk_mcp_server(name="rpent", version="0.1.0", tools=sdk_tools)
+    return sdk.create_sdk_mcp_server(
+        name="rpent",
+        version="0.1.0",
+        tools=sdk_tools,
+    )
 
 
 def _tool_result_to_mcp(tr: Any) -> dict[str, Any]:
-    # The toolkit already formatted the result into Anthropic content blocks;
-    # translate those into the MCP content shape (text + image).
+    """将 RPent ``ToolResult`` 转换为 Claude SDK 所需的 MCP content。"""
+    # Toolkit 已把环境结果组织为 Anthropic 风格的文本/图片 block。这里只改字段
+    # 形状，不重新读取图像，也不丢弃动作后采集的多模态反馈。
     blocks = getattr(tr, "content_blocks", None)
     if blocks is None:
         return {"content": [{"type": "text", "text": str(tr)}]}
@@ -810,6 +829,7 @@ def _tool_result_to_mcp(tr: Any) -> dict[str, Any]:
     response: dict[str, Any] = {"content": content}
     result_dict = getattr(tr, "result", None)
     if isinstance(result_dict, dict) and result_dict.get("error"):
+        # MCP 的 is_error 让 Claude 知道该工具失败，但会话仍可继续并尝试恢复。
         response["is_error"] = True
     return response
 
