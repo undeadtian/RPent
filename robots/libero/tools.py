@@ -1,4 +1,19 @@
-"""LIBERO + OpenPI tool implementation."""
+"""LIBERO 机器人原语、感知工具与状态产物实现。
+
+本模块位于 Planner 工具调用与单环境 LIBERO 执行服务之间，主要承担四类职责：
+
+* :class:`LiberoPrimitives` 缓存最近观测，把 Pi0.5/VLA 动作块或脚本化
+  OSC 动作推进到环境，并按环境步录制诊断帧；
+* 将 RGB-D、相机标定和机器人状态写入 :class:`~rpent.tools.state.EnvState`，
+  预计算与图像逐像素对齐的世界坐标图；
+* 提供 SAM3 分割、像素反投影和状态查看等只读工具，以及从成功轨迹导出
+  可复用 recipe 的逻辑；
+* 以 ``TOOLS_SPEC`` 声明 Planner 可见的工具 schema。schema 到 Python handler
+  的绑定由 :class:`robots.libero.toolkit.LiberoToolkit` 完成。
+
+除显式标记为 ``@readonly`` 的感知函数外，primitive 会推进模拟器；状态落盘与
+Dashboard 发布由 ``LiberoToolkit`` 在动作结束后的统一生命周期中完成。
+"""
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -17,7 +32,11 @@ logger = get_logger("libero")
 
 
 def _normalize_xyz(xyz):
-    """Coerce an LLM-supplied xyz into a length-3 list[float]."""
+    """把 LLM 传入的三维坐标规范化为三个 ``float``。
+
+    工具参数来自 JSON，因而这里只接受长度严格为 3 的列表或元组；尽早抛出
+    可读错误可避免形状异常进入后续 NumPy 广播或 OSC 控制计算。
+    """
     if not isinstance(xyz, (list, tuple)) or len(xyz) != 3:
         raise ValueError(
             'xyz must be a JSON array of three numbers, e.g. "xyz":[-0.05,0,0.3]'
@@ -26,12 +45,23 @@ def _normalize_xyz(xyz):
 
 
 class LiberoPrimitives:
-    """Wraps a single-env LIBERO-shaped env + VLA policy with primitive-
-    level methods.
+    """封装单环境 LIBERO 客户端、VLA 策略与视觉分割服务。
 
-    ``pi0_pick`` and ``pi0_doubled`` override ``obs['task_descriptions']``
-    with a sub-instruction. ``move_to`` and friends are scripted (no VLM
-    call) and drive the underlying OSC controller directly.
+    实例始终缓存最近一次策略观测及从 ``states`` 提取的末端位置、高度和夹爪
+    开合代理量。所有动作入口共享这份缓存：``pi0_pick``/``pi0_doubled`` 临时把
+    顶层任务描述替换为局部指令并执行 VLA chunk；``move_to``、姿态旋转和
+    ``release`` 则直接向底层 OSC 控制器发送 7 维动作。
+
+    录制缓冲区按“环境步”保存主相机帧。脚本动作由 :meth:`_step_env` 逐帧追加，
+    VLA 动作块则要求环境返回 chunk 内全部观测后逐帧追加，因此 Dashboard 的
+    单动作视频和最终 episode 视频共用同一条连续时间线。只读的 :meth:`segment`
+    仅消费已落盘产物，不推进环境。
+
+    Args:
+        env: 单环境 LIBERO RPC 客户端，负责 reset、step、chunk_step 与渲染。
+        model: 输出动作块的 VLA 客户端。
+        sam3_client: 对既有 RGB 产物执行文本或点提示分割的客户端。
+        check_cancelled: 在模型调用和环境推进的安全边界检查取消状态的回调。
     """
 
     def __init__(
@@ -41,57 +71,83 @@ class LiberoPrimitives:
         sam3_client: Sam3Client,
         check_cancelled: Callable[[], None],
     ):
+        """保存服务依赖，并初始化最近观测缓存与 episode 帧缓冲区。"""
         self.env = env
         self.model = model
         self._sam3_client = sam3_client
         self._check_cancelled = check_cancelled
+
+        # 最近观测是所有 primitive 的单一状态来源；派生字段避免每个控制循环重复
+        # 解析 ``states``，同时确保成功判定和脚本控制读取的是同一环境时刻。
         self._last_obs = None
         self._last_obs_eef_pos = None
         self._last_obs_eef_z = None
         self._last_obs_gripper = None
-        # Per-env-step frame buffer for diagnostic video rendering.
-        # Toggled via start_recording() / stop_recording().
+
+        # 按环境步保存主相机帧。start/stop 控制一次完整 episode 的生命周期，
+        # frame_slice 则让 Toolkit 从同一缓冲区截取某次工具调用对应的短片。
         self._recording = False
         self._frames = []
 
     def start_recording(self):
+        """开始新的 episode 录制，并清空此前残留的帧。"""
         self._recording = True
         self._frames = []
 
     def record_frame(self, obs):
-        """Append one agentview frame extracted from ``obs`` to the buffer."""
+        """从策略观测提取主相机图像，并以连续内存布局追加一帧。
+
+        连续数组可直接交给后续视频编码器，避免引用环境复用的观测缓冲区。
+        """
         self._frames.append(np.ascontiguousarray(np.asarray(obs["main_images"])))
 
     def recorded_frame_count(self) -> int:
+        """返回当前 episode 已录制的环境步帧数，供动作片段游标使用。"""
         return len(self._frames)
 
     def stop_recording(self) -> list[np.ndarray]:
+        """停止录制、移交全部帧并清空内部缓冲区。
+
+        返回浅复制的列表后再重置内部列表，使调用方保存 episode 视频时不受后续
+        生命周期影响；帧数组本身保持不复制。
+        """
         frames = list(self._frames)
         self._recording = False
         self._frames = []
         return frames
 
     def frame_slice(self, start: int) -> list[np.ndarray]:
+        """从帧游标 ``start`` 起复制列表切片，用于生成单次动作视频。"""
         return list(self._frames[int(start):])
 
     def set_obs(self, obs):
+        """更新最近策略观测及控制/成功判定所需的派生状态缓存。
+
+        ``states[:3]`` 是末端世界坐标；夹爪没有直接的开口宽度字段，因此使用
+        robosuite 2F-85 两个手指关节绝对值之和作为开合代理量：约 ``0.08`` 为
+        张开，接近 ``0`` 为闭合。
+        """
         self._last_obs = obs
         states_arr = np.asarray(obs["states"])
         self._last_obs_eef_pos = np.asarray(states_arr[:3], dtype=np.float32)
         self._last_obs_eef_z = float(self._last_obs_eef_pos[2])
-        # robosuite 2f85: qpos[6] in [~0, ~0.04], qpos[7] in [~-0.04, ~0].
-        # Use |qpos[6]| + |qpos[7]| ≈ finger separation proxy.
-        # When open ≈ 0.08; when closed ≈ 0.
+        # robosuite 2F-85 的 qpos[6] 约在 [0, 0.04]，qpos[7] 约在
+        # [-0.04, 0]；两者绝对值之和可作为手指间距代理量。
         gp = np.asarray(states_arr[6:8], dtype=np.float32)
         self._last_obs_gripper = float(abs(gp[0]) + abs(gp[1]))
 
     def reset(self):
+        """重置远端环境、刷新状态缓存，并返回初始观测与环境信息。"""
         obs, info = self.env.reset()
         self.set_obs(obs)
         return self._last_obs, info
 
     def _step_env(self, action) -> None:
-        """Execute one env action between cancellation checkpoints."""
+        """在取消检查之间执行一个环境动作，并同步缓存与录制帧。
+
+        该入口是所有脚本化 OSC primitive 的共同推进路径，保证每一步动作之后的
+        最新观测都可用于下一轮闭环控制；启用录制时恰好追加一帧。
+        """
         self._check_cancelled()
         obs, _r, _t, _tr, _i = self.env.step(action)
         self.set_obs(obs)
@@ -158,19 +214,24 @@ class LiberoPrimitives:
         lift_thresh: float = 0.05,
         gripper_closed_thresh: float = 0.06,
     ) -> dict:
-        """Closed-loop Pi0.5 pick driven by ``prompt`` as the VLA instruction.
+        """用 ``prompt`` 作为局部 VLA 指令执行闭环抓取。
 
-        Success := eef lifted by >= ``lift_thresh`` AND gripper_opening
-        below ``gripper_closed_thresh``. Terminates early on libero
-        ``terminated`` (official success) or ``max_chunks``.
+        每轮调用 :meth:`_vlm_chunk` 执行一个完整动作块，再从最新缓存读取末端高度
+        与夹爪开口。成功不是简单使用全程最高点与最低点之差，而是要求：机械臂
+        先相对起点下降至少 ``0.10`` 米进入抓取阶段，随后从最新最低点上升至少
+        ``lift_thresh``，且当前夹爪代理开口小于 ``gripper_closed_thresh``。
+        这可避免“仅向下接近物体”被误判成抬升成功。
+
+        环境 ``terminated``/``truncated`` 或 ``max_chunks`` 会提前结束循环；只有
+        官方 ``terminated`` 在环境结束分支中计为成功。返回值同时保留高度、夹爪
+        和动作块数量诊断，供 Planner 结合图像复核。
         """
         instr = prompt
         start_z = self._last_obs_eef_z
         peak_z = start_z
         min_z = start_z
-        # Track ascent AFTER min_z has been observed — descent then re-ascent
-        # is the actual "lift" signal, distinct from raw |peak - min| which
-        # also fires at the BOTTOM of the descent.
+        # 只跟踪“最近一次最低点之后”的峰值：下降后重新上升才是抓取抬升信号。
+        # 若使用全程 |peak - min|，机械臂刚到下降最低点时也可能被错误触发。
         post_min_peak_z = start_z
         min_grip = self._last_obs_gripper
         last_grip = min_grip
@@ -186,10 +247,10 @@ class LiberoPrimitives:
             peak_z = max(peak_z, z)
             if z < min_z:
                 min_z = z
-                post_min_peak_z = z  # reset after a new deeper min
+                post_min_peak_z = z  # 出现更低点后，重新开始累计后续上升
             else:
                 post_min_peak_z = max(post_min_peak_z, z)
-            if (start_z - min_z) >= 0.10:  # descended ≥ 10 cm — committed to grasp
+            if (start_z - min_z) >= 0.10:  # 下降至少 10 cm，确认已进入抓取阶段
                 descent_done = True
             min_grip = min(min_grip, grip)
             last_grip = grip
@@ -208,7 +269,7 @@ class LiberoPrimitives:
             "success": success,
             "chunks_used": chunks_used,
             "max_chunks": max_chunks,
-            "peak_lift_m": post_min_peak_z - min_z,  # actual post-descent ascent
+            "peak_lift_m": post_min_peak_z - min_z,  # 最近最低点后的真实抬升量
             "min_gripper_opening": min_grip,
             "final_gripper_opening": last_grip,
             "terminated": self.env.terminated,
@@ -232,11 +293,13 @@ class LiberoPrimitives:
         *,
         max_chunks: int = 20,
     ) -> dict:
-        """Closed-loop Pi0.5 contact skill.
+        """执行面向非抓取接触动作的闭环 Pi0.5 技能。
 
-        Intended for non-pick contact interactions such as turning knobs,
-        toggling stoves, or short pushes. Success is the official LIBERO
-        termination predicate, not a private object-pose oracle.
+        典型用途是旋钮、炉灶开关、按钮或短距离推动。每轮执行一个 VLA chunk，
+        直到官方任务谓词使环境 ``terminated``、环境 ``truncated``，或耗尽
+        ``max_chunks``。该 primitive 没有访问物体真值位姿的私有成功判定，因此
+        中间接触动作即使已经完成，只要整项 LIBERO 任务尚未终止，返回的
+        ``success`` 仍为 ``False``；调用方应结合落盘图像和状态判断。
         """
         instr = prompt
         task_success = False
@@ -280,12 +343,15 @@ class LiberoPrimitives:
         target_yaw: float | None = None,
         yaw_step_clip: float = 0.10,
     ) -> dict:
-        """Scripted EEF servo to a world-frame target xyz.
+        """用脚本化 OSC 闭环将末端伺服到世界坐标 ``xyz``。
 
-        Sends 7-D delta actions; the env's underlying OSC_POSE controller
-        interprets ``action[:3] ∈ [-1, 1]`` as a per-step desired delta scaled
-        by ``action_scale`` (so ``action=1.0`` -> ~5 cm per env step).
-        ``gripper``: +1.0 keeps it closed (holding object), -1.0 opens.
+        每个环境步重新读取缓存的末端位置，将世界坐标误差逐轴裁剪到
+        ``step_clip``，再除以 ``action_scale`` 映射到控制器的 ``[-1, 1]``
+        平移动作范围。到达 ``tol``、环境结束或耗尽 ``max_steps`` 时停止。
+
+        7 维动作的前三维是位置增量，第 3--5 维是轴角旋转，第 6 维是夹爪命令；
+        ``gripper=+1`` 用于持物，``-1`` 用于张开。可选 ``target_yaw`` 会在同一
+        控制步内计算世界 Z 轴腕部偏航，但其余姿态保持由 OSC 控制器稳定。
         """
         target = np.asarray(_normalize_xyz(xyz), dtype=np.float32)
         traj = []
@@ -302,14 +368,13 @@ class LiberoPrimitives:
                 break
             step_dxyz = np.clip(diff, -step_clip, step_clip)
             action = np.zeros(7, dtype=np.float32)
-            action[:3] = step_dxyz / action_scale  # -> roughly [-0.5, 0.5]
+            action[:3] = step_dxyz / action_scale  # 映射后通常约落在 [-0.5, 0.5]
             action[:3] = np.clip(action[:3], -1.0, 1.0)
             if target_yaw is not None:
-                # add wrist yaw control via action[5] (z-axis axis-angle).
-                # NOTE: extract world yaw via atan2(R[1,0], R[0,0]), NOT
-                # as_euler('zyx')[0] — the latter returns -world_yaw for
-                # gripper-down configs (R[2,2]≈-1) and silently flips the
-                # commanded rotation direction. See feedback_rotate_wrist_yaw_sign.
+                # action[5] 是绕 Z 轴的轴角分量。世界偏航必须用
+                # atan2(R[1, 0], R[0, 0]) 提取；对夹爪朝下的姿态
+                # （R[2, 2]≈-1），as_euler('zyx')[0] 会落入另一欧拉角图表并
+                # 返回相反符号，进而静默翻转控制方向。
                 from scipy.spatial.transform import Rotation as _R
                 q = self.env.raw_obs()["robot0_eef_quat"]
                 _R_mat = _R.from_quat([q[0], q[1], q[2], q[3]]).as_matrix()
@@ -343,30 +408,27 @@ class LiberoPrimitives:
         tol: float = 0.02,
         step_clip: float = 0.10,
     ) -> dict:
-        """Rotate wrist around world z-axis. Provide EITHER target_yaw (absolute)
-        or delta_yaw (relative, applied as a single rotation goal).
+        """围绕世界坐标 Z 轴旋转腕部，并在旋转期间保持位置与夹爪命令。
 
-        Uses ``action[5]`` (axis-angle z component) to drive wrist yaw via the
-        OSC controller. Holds xyz pose constant during rotation.
+        ``target_yaw``（绝对角）和 ``delta_yaw``（相对初始角）至少提供一个；
+        相对角只在入口处转换一次固定目标，避免闭环中逐步累加。控制器通过
+        ``action[5]`` 接收 Z 轴轴角增量，每步将环绕误差归一化到 ``[-π, π]``，
+        再按 ``step_clip`` 裁剪，直到进入 ``tol`` 或达到停止条件。
 
-        Yaw is the world-frame z-rotation, recovered as
-        ``atan2(R[1,0], R[0,0])`` where R is the eef rotation matrix in the
-        world frame. (Note: ``as_euler('zyx')[0]`` returns the *negative*
-        of this value for gripper-down configurations because the Z-Y-X
-        decomposition picks the chart with γ ≈ π, flipping α. Bug fixed
-        2026-05-19 — previous implementation rotated the wrist in the
-        opposite direction of the commanded yaw.)
+        世界偏航定义为末端 X 轴在世界 XY 平面的投影角，即
+        ``atan2(R[1, 0], R[0, 0])``。不能直接采用 ``as_euler('zyx')[0]``：
+        夹爪朝下（``R[2, 2]≈-1``）时，该欧拉分解会选择另一参数图表并翻转首角
+        符号，导致腕部朝命令的反方向旋转。
         """
         from scipy.spatial.transform import Rotation as _R
 
         def _yaw_of(quat_xyzw):
-            # robot0_eef_quat in libero+robosuite is xyzw (scipy convention).
+            """从 robosuite 的 xyzw 四元数提取世界坐标偏航角。"""
             q = quat_xyzw
             rot = _R.from_quat([q[0], q[1], q[2], q[3]])
             R = rot.as_matrix()
-            # World-frame yaw: angle of the eef x-axis projected onto the
-            # world xy plane. Robust to gripper-down (R[2,2]≈-1) which is
-            # where the euler 'zyx' chart flips sign.
+            # 取末端 X 轴在世界 XY 平面的方向；该定义在夹爪朝下
+            # （R[2, 2]≈-1）时仍连续，不受 Z-Y-X 欧拉角图表翻转影响。
             return float(np.arctan2(R[1, 0], R[0, 0]))
 
         raw = self.env.raw_obs()
@@ -382,14 +444,14 @@ class LiberoPrimitives:
             raw = self.env.raw_obs()
             cur_yaw = _yaw_of(raw["robot0_eef_quat"])
             err = float(target_yaw - cur_yaw)
-            # wrap to [-pi, pi]
+            # 环绕到 [-π, π]，选择最短旋转方向。
             err = (err + np.pi) % (2 * np.pi) - np.pi
             traj.append({"step": step, "yaw": round(cur_yaw, 4), "err": round(err, 4)})
             if abs(err) < tol:
                 break
             step_dyaw = float(np.clip(err, -step_clip, step_clip))
             action = np.zeros(7, dtype=np.float32)
-            action[5] = step_dyaw / 0.10  # scale to ~[-1,1] action range
+            action[5] = step_dyaw / 0.10  # 映射到约 [-1, 1] 的动作范围
             action[5] = float(np.clip(action[5], -1.0, 1.0))
             action[6] = float(gripper)
             self._step_env(action)
@@ -417,34 +479,21 @@ class LiberoPrimitives:
         tol: float = 0.02,
         step_clip: float = 0.10,
     ) -> dict:
-        """Tilt the gripper around the world X-axis ("pitch").
+        """围绕世界 X 轴倾斜夹爪，并在旋转期间保持位置、偏航和夹爪命令。
 
-        Pitch is defined as the angle between the eef z-axis and the
-        world -z direction, measured in the world yz-plane:
+        俯仰角按末端 Z 轴相对世界 ``-Z`` 方向在 YZ 平面中的夹角定义：
+        ``pitch = atan2(R[1, 2], -R[2, 2])``。因此 ``0`` 表示常见的夹爪朝下
+        姿态，``+π/2`` 表示末端 Z 轴指向世界 ``+Y``，``-π/2`` 则指向
+        ``-Y``。OSC 通过 ``action[3]`` 的 X 轴轴角分量驱动该角度。
 
-            pitch = atan2(R[1, 2], -R[2, 2])
-
-        - pitch =  0       -> gripper z-axis aligned with world -z (default
-                              "gripper down" rest pose).
-        - pitch = +pi/2    -> gripper z-axis points in world +y (gripper
-                              "looking forward" along world +y).
-        - pitch = -pi/2    -> gripper z-axis points in world -y.
-
-        Driven by ``action[3]`` (axis-angle X component) of the OSC_POSE
-        controller. Sign verified empirically (probe_pitch.py 2026-05-19):
-        action[3]=+1.0 tilts eef z toward world +y, matching this pitch
-        definition with no sign flip.
-
-        Holds xyz, yaw, and gripper constant during rotation. Use BEFORE
-        threading the gripper into a narrow opening whose front face
-        normal is along world ±y (e.g. microwave cavity in libero_10 t9).
-
-        Provide EITHER ``target_pitch`` (absolute) or ``delta_pitch``
-        (relative). Both in radians.
+        ``target_pitch``（绝对角）和 ``delta_pitch``（相对初始角）至少提供一个。
+        该 primitive 适合在进入正面法向沿世界 ``±Y`` 的狭窄开口前先调整姿态；
+        每步对最短环绕误差裁剪，直到进入 ``tol`` 或达到环境/步数停止条件。
         """
         from scipy.spatial.transform import Rotation as _R
 
         def _pitch_of(quat_xyzw):
+            """从 xyzw 四元数计算上述世界 YZ 平面俯仰定义。"""
             q = quat_xyzw
             R = _R.from_quat([q[0], q[1], q[2], q[3]]).as_matrix()
             return float(np.arctan2(R[1, 2], -R[2, 2]))
@@ -504,22 +553,26 @@ class LiberoPrimitives:
         action_scale: float = 0.05,
         max_steps: int = 150,
     ) -> dict:
-        """Servo position AND orientation (pitch + yaw) SIMULTANEOUSLY.
+        """在同一 OSC 闭环中同时伺服位置、俯仰和偏航。
 
-        Unlike ``move_to`` (holds orientation) + ``rotate_pitch`` (holds
-        xyz), this co-varies xyz and wrist tilt every env.step. Co-variation
-        lets the OSC controller thread cabinet-front-low poses where a
-        decoupled position servo (fixed gripper-down orientation) drives
-        the wrist into a singularity and stalls — mimicking pi0's curved
-        reach-in.
+        与先 ``move_to`` 再 ``rotate_pitch`` 的解耦方式不同，本方法在每个环境步
+        同时更新平移和旋转动作。位置误差逐轴裁剪，俯仰/偏航误差分别环绕到
+        ``[-π, π]`` 并裁剪后写入 ``action[3]``/``action[5]``。只有位置进入
+        ``tol`` 且两个已指定姿态目标均进入 ``ori_tol`` 才算到达。
+
+        位姿协同变化可形成类似 Pi0 的弧线接近轨迹，用于柜体正面或低层搁板等
+        固定朝下姿态容易把腕部推入逆解奇异点的位置。循环仍通过 :meth:`_step_env`
+        逐步刷新状态、响应取消并录制帧。
         """
         from scipy.spatial.transform import Rotation as _R
 
         def _pitch_of(q):
+            """计算末端 Z 轴相对世界 ``-Z`` 的俯仰角。"""
             R = _R.from_quat([q[0], q[1], q[2], q[3]]).as_matrix()
             return float(np.arctan2(R[1, 2], -R[2, 2]))
 
         def _yaw_of(q):
+            """计算末端 X 轴投影到世界 XY 平面后的偏航角。"""
             R = _R.from_quat([q[0], q[1], q[2], q[3]]).as_matrix()
             return float(np.arctan2(R[1, 0], R[0, 0]))
 
@@ -565,16 +618,18 @@ class LiberoPrimitives:
         *,
         max_steps: int = 20,
     ) -> dict:
-        """Open gripper for ``max_steps`` env steps while keeping eef in place.
+        """保持末端位姿不变，连续发送张开夹爪命令。
 
-        Returns once libero terminates (success) or step budget exhausted.
+        每一步仅设置 7 维动作的夹爪分量，并通过 :meth:`_step_env` 推进环境；
+        LIBERO 的 ``On``/``In`` 等谓词可能在释放后触发官方终止。循环在环境结束
+        或耗尽 ``max_steps`` 时停止，返回起始、过程峰值和最终开口代理量。
         """
         assert max_steps > 0, f"max_steps must be > 0, got {max_steps}"
         start_grip = self._last_obs_gripper
         peak_grip = start_grip
         for step in range(max_steps):
             action = np.zeros(7, dtype=np.float32)
-            action[6] = -1.0  # open
+            action[6] = -1.0  # 张开夹爪
             self._step_env(action)
             peak_grip = max(peak_grip, self._last_obs_gripper)
             if self.env.terminated or self.env.truncated:
@@ -595,7 +650,11 @@ class LiberoPrimitives:
         gripper: float = -1.0,
         steps: int = 5,
     ) -> dict:
-        """Hold the current EEF pose and drive ``gripper`` for ``steps`` env steps."""
+        """保持当前末端位姿，连续 ``steps`` 步发送指定夹爪命令。
+
+        该低层 primitive 常用于搬运途中加固抓持；与 :meth:`release` 一样不发送
+        平移或旋转增量，并在环境终止/截断时提前停止。
+        """
         g = float(gripper)
         n = int(steps)
         for _ in range(n):
@@ -612,7 +671,7 @@ class LiberoPrimitives:
             "truncated": self.env.truncated,
         }
 
-    # ---- introspection helpers (for LLM-in-the-loop) ----
+    # ---- 供 LLM 闭环调用的只读感知辅助工具 ----
 
     @readonly
     def segment(
@@ -625,11 +684,17 @@ class LiberoPrimitives:
         *,
         state: EnvState,
     ) -> dict:
-        """Call SAM3 on an existing image artifact without advancing the env.
+        """对既有 RGB 产物执行 SAM3 分割，并估计掩码对应的世界坐标。
 
-        This tool deliberately does not render camera views or create wrist/high-res
-        artifacts. Errors are structured so the agent can continue with image
-        inspection and ``back_project``.
+        这是只读工具：它从 ``EnvState`` 选择指定 step 的主相机或腕部图像及与之
+        同分辨率的预计算世界图，不渲染新视角也不推进模拟器。调用必须在文本
+        ``prompt`` 与单个正点 ``point=[row, col]`` 中恰好选择一种；优先使用成对
+        存在的高分辨率产物，缺失时回退到标准分辨率。
+
+        SAM3 返回首选掩码后，方法以掩码内有效深度点各轴中位数生成 ``world_xyz``，
+        保存可复查的 ``segment_XX.json`` 和半透明覆盖图。服务失败、产物缺失、
+        掩码为空或世界图不匹配均转换为结构化错误，使 Planner 可回退到手工观察
+        与 :func:`back_project`，而不会中断 episode。
         """
         try:
             record = state.get(step)
@@ -641,8 +706,12 @@ class LiberoPrimitives:
         prompt = prompt.strip()
         has_prompt = bool(prompt)
         has_point = point is not None
+        # SAM3 的两种提示模式互斥；空白文本视为未提供，避免同时把文本和点
+        # 传给远端服务造成含糊的分割语义。
         if has_prompt == has_point:
             return {"error": "segment needs exactly one of prompt or point"}
+        # 图像与世界图必须来自同一 camera、step 和分辨率；成对选择可避免把
+        # SAM3 像素索引投到另一套坐标网格。
         try:
             image_name, world_name, artifact_pairs = _select_segment_artifacts(
                 state, record, camera
@@ -690,6 +759,9 @@ class LiberoPrimitives:
         overlay_name = f"segment_overlay_{segment_index:02d}.png"
         saved_overlay = None
         mask = data.mask
+        # 只有服务明确找到目标且返回 NumPy 掩码时才访问世界图。世界坐标计算与
+        # 覆盖图保存彼此独立：深度产物损坏仍可保留分割诊断，覆盖图保存失败也
+        # 不会抹掉已计算的坐标。
         if data.found and isinstance(mask, np.ndarray):
             try:
                 world_map = state.load(world_name, step=nn)
@@ -769,10 +841,10 @@ class LiberoPrimitives:
 
 
 def _is_primitive_action(name: object) -> bool:
-    """Whether ``name`` is a state-advancing LIBERO primitive.
+    """判断工具名是否对应会推进 LIBERO 状态的 primitive。
 
-    A primitive is any non-read-only method on :class:`LiberoPrimitives`;
-    read-only tools and non-strings read as ``False``.
+    判定依据是 :class:`LiberoPrimitives` 上存在同名方法且未标记 ``@readonly``；
+    非字符串、分割和其他只读工具均返回 ``False``，用于 recipe 过滤。
     """
     if not isinstance(name, str):
         return False
@@ -781,14 +853,26 @@ def _is_primitive_action(name: object) -> bool:
 
 
 def write_recipe_from_states(state: EnvState, recipe_tag: str) -> str:
-    """Find a command sequence that gets ``terminated=True``.
+    """从 ``EnvState`` 轨迹导出可重放的 LIBERO primitive JSONL。
 
-    Export non-error LIBERO primitive commands and successful segment calls.
+    按 step 扫描状态记录，保留没有结构化错误的状态推进命令；同一步上由只读
+    :meth:`LiberoPrimitives.segment` 另存的成功分割也会还原为工具命令。分割事件
+    以其 ``segment_index`` 排在所属 step 的动作之后，从而保留原始调用顺序。
+    最终只写公开工具参数，不导出观测、结果或内部 ``state`` 对象。
+
+    Args:
+        state: 当前运行的完整状态与产物存储。
+        recipe_tag: 用于生成 ``recipe_<tag>.jsonl`` 文件名的标签。
+
+    Returns:
+        已保存的 recipe 产物名。
     """
     command_events = []
     for record in state.records():
         command = record.command
         result = record.result
+        # record.command 只代表会生成新 StepRecord 的动作调用；错误动作不应进入
+        # 可重放 recipe，只读工具则由其持久化产物单独恢复。
         if (
             command is not None
             and _is_primitive_action(command.get("action"))
@@ -796,6 +880,8 @@ def write_recipe_from_states(state: EnvState, recipe_tag: str) -> str:
         ):
             command_events.append(((record.step_idx, -1), command))
 
+        # segment 是只读调用，不创建新 step；成功调用由当前记录下的编号 JSON
+        # 产物恢复，并用 segment_index 保持同一步内的先后次序。
         for name in sorted(record.artifacts):
             if not (name.startswith("segment_") and name.endswith(".json")):
                 continue
@@ -828,6 +914,12 @@ def write_recipe_from_states(state: EnvState, recipe_tag: str) -> str:
 
 
 def _metric_depth(depth: Any, camera_meta: dict) -> np.ndarray:
+    """把环境深度缓冲转换为二维、米制 ``float32`` 深度图。
+
+    robosuite 深度通常是投影空间中的归一化值；当标定包含 ``depth_near`` 与
+    ``depth_far`` 时，使用相同投影模型反解相机 Z 深度。若上游已经提供米制值或
+    标定缺失，则仅规范化形状和 dtype，不猜测额外尺度。
+    """
     d = np.asarray(depth, dtype=np.float32)
     if d.ndim == 3:
         d = d[..., 0]
@@ -839,6 +931,13 @@ def _metric_depth(depth: Any, camera_meta: dict) -> np.ndarray:
 
 
 def _world_from_depth(depth_metric: np.ndarray, camera_meta: dict) -> np.ndarray:
+    """将米制深度图逐像素反投影为世界坐标图。
+
+    对像素 ``(row, col)``，先用内参 ``K`` 恢复相机坐标
+    ``[(col-cx)z/fx, (row-cy)z/fy, z]``，追加齐次分量后再乘
+    ``extrinsic_cam2world``。返回数组形状为 ``[H, W, 3]``，与输入深度及对应
+    RGB 完全逐像素对齐，供分割掩码聚合和 :func:`back_project` 直接索引。
+    """
     k_matrix = np.array(camera_meta["intrinsic_K"], dtype=np.float64)
     extrinsic = np.array(camera_meta["extrinsic_cam2world"], dtype=np.float64)
     fx, fy = k_matrix[0, 0], k_matrix[1, 1]
@@ -858,7 +957,18 @@ def dump_state(
     env_state: EnvState,
     log: dict | None = None,
 ) -> StepRecord:
-    """Save one Libero observation through its owned state record."""
+    """把当前 LIBERO 观测原子化写成一个 ``StepRecord``。
+
+    首先从 ``raw_obs`` 提取末端位姿、夹爪关节与对象名等轻量 JSON 状态，再通过
+    :meth:`EnvState.record_step` 建立记录上下文，将任务语言、终止标志以及可选的
+    命令/结果/耗时绑定到同一 step。上下文内部调用
+    :func:`_save_observation_artifacts` 保存 RGB、深度、相机标定和世界坐标图；
+    退出上下文后记录才完整可见并返回。
+
+    ``log=None`` 用于 reset 后的 step 0，此时没有关联命令；动作后的调用则把
+    Planner 命令与 primitive 原始结果一起保留下来，供状态查看、Dashboard 和
+    recipe 导出复用。
+    """
     raw = primitives.env.raw_obs()
     state = {
         "robot0_eef_pos": [float(x) for x in raw["robot0_eef_pos"]],
@@ -892,13 +1002,22 @@ def _save_observation_artifacts(
     step_idx: int,
     raw: dict[str, Any],
 ) -> None:
+    """保存一个 step 的多视角 RGB-D、标定与预计算世界坐标产物。
+
+    产物分为策略方向主图、与相机标定/深度严格对齐的标准分辨率主视角和腕部
+    视角，以及按需渲染的 1024×1024 高分辨率 RGB/世界图。主相机外参静态，
+    腕部相机外参随机械臂运动，因此后者必须逐 step 保存。
+
+    每组可选产物独立捕获异常：单个相机或高分辨率渲染失败不会阻止机器人状态
+    记录落盘。调用方应以 ``StepRecord.artifacts`` 判断某项产物是否可用。
+    """
     env_state.save(
         "agentview_policy.png",
         primitives._last_obs["main_images"],
         step=step_idx,
     )
 
-    # --- camera calibration (static for agentview): fetch metadata as needed ---
+    # 主相机标定在 episode 内静态；仍按 step 保存，使每条记录可独立解释其产物。
     agentview_meta = primitives.env.get_camera_meta(
         camera_name="agentview",
         height=256,
@@ -923,9 +1042,8 @@ def _save_observation_artifacts(
             step=step_idx,
         )
 
-    # --- per-step RGB in the depth/K frame (vertical-flip of the raw buffer) ---
-    # Agentview pixels align with the matching depth and calibration. The policy
-    # image uses Pi0 orientation and must not supply back-projection pixels.
+    # 保存与深度/K 同坐标系的标准分辨率 RGB：robosuite 原始缓冲区需垂直
+    # 翻转。策略图采用 Pi0 方向，只供策略/展示，不能提供反投影像素。
     try:
         ci = raw.get("agentview_image")
         if ci is not None:
@@ -940,17 +1058,14 @@ def _save_observation_artifacts(
     except Exception as e:
         logger.warning("image_cam dump failed: %s", e)
 
-    # --- per-step metric depth (agentview), native orientation, in meters ---
+    # 保存逐 step 的主相机米制深度与世界图，二者均采用标定坐标方向。
     try:
         d = raw.get("agentview_depth")
         if d is not None:
-            # Vertical flip to align with the camera matrices: robosuite's
-            # camera_utils projection M = K_exp @ inv(extrinsic) expects the
-            # depth map in this frame. VERIFIED 5/5: projecting each GT object
-            # world pos via M lands on a pixel whose depth_flip[row,col] matches
-            # the object's surface depth (plate Δ6mm, cookies Δ14mm). So
-            # Pixels in agentview.png align with agentview_depth.npz and the
-            # per-step agentview metadata saved with the record artifacts.
+            # 垂直翻转后才与相机矩阵一致：robosuite 的投影
+            # M = K_exp @ inv(extrinsic) 以该方向解释深度。实测将对象真值世界坐标
+            # 投到图像后，对应像素深度与物体表面深度一致，因此 agentview.png、
+            # agentview_depth.npz 和本 step 标定可以逐像素配套使用。
             d = _metric_depth(d, agentview_meta)[::-1]
             env_state.save(
                 "agentview_depth.npz",
@@ -966,7 +1081,7 @@ def _save_observation_artifacts(
     except Exception as e:
         logger.warning("depth dump failed: %s", e)
 
-    # --- per-step wrist camera (robot0_eye_in_hand), calibration frame ---
+    # 腕部相机随末端运动：RGB、深度、世界图和外参必须来自同一 step。
     try:
         wimg = raw.get("robot0_eye_in_hand_image")
         if wimg is None:
@@ -1026,6 +1141,8 @@ def _save_observation_artifacts(
     except Exception as e:
         logger.warning("wrist depth/world dump failed: %s", e)
 
+    # 额外渲染 1024×1024 主视角供精细定位；世界图降为 float16 以控制
+    # EnvState 产物体积，RGB 与世界图仍保持相同翻转和像素索引。
     try:
         rgb_hi, depth_hi = primitives.env.render_camera(
             camera_name="agentview",
@@ -1053,6 +1170,7 @@ def _save_observation_artifacts(
     except Exception as e:
         logger.warning("agentview high-res dump failed: %s", e)
 
+    # 腕部高分辨率视角同样在当前末端姿态下即时渲染，不能复用其他 step 外参。
     try:
         rgb_wrist_hi, depth_wrist_hi = primitives.env.render_camera(
             camera_name="robot0_eye_in_hand",
@@ -1084,8 +1202,12 @@ def _save_observation_artifacts(
 
 
 # ---------------------------------------------------------------------------
-# Tool schema declarations (Anthropic-shaped canonical schema)
+# Planner 工具 schema（Anthropic 形状的规范声明）
 # ---------------------------------------------------------------------------
+# 此列表只描述公开工具名、说明和 JSON 输入约束，不在这里持有运行时对象。
+# LiberoToolkit._register_libero_tools 会逐项遍历：状态感知工具通过 partial 注入
+# 当前 EnvState，其他同名动作则绑定到 LiberoPrimitives；找不到 handler 的条目
+# 不会注册。以下 description/schema 是执行协议的一部分，不应随文档整理而改写。
 
 TOOLS_SPEC = [
     {
@@ -1436,6 +1558,15 @@ TOOLS_SPEC = [
 
 @readonly
 def view_env_state(step: int = -1, *, state: EnvState) -> dict:
+    """读取一个 ``StepRecord``，并组装 Planner/Dashboard 可消费的状态视图。
+
+    ``step=-1`` 选择最新记录。返回轻量 JSON 状态、终止标志、命令日志和产物清单，
+    并为三个约定槽位附加图像字节：策略主图、标定方向主视角、腕部视角。
+    标定/腕部图优先读取 1024×1024 版本，缺失时回退到标准分辨率；单个文件在
+    清单存在但磁盘缺失时仅跳过该图，不使整次状态查看失败。
+
+    函数标记为 ``@readonly``，因此调用本身不会触发新的环境 step 或状态 dump。
+    """
     try:
         record = state.get(step)
     except Exception as exc:
@@ -1475,6 +1606,12 @@ def _select_segment_artifacts(
     record: StepRecord,
     camera: str,
 ) -> tuple[str | None, str | None, list[tuple[str | None, str | None]]]:
+    """为分割选择同相机、同分辨率且实际存在的 RGB/世界图产物对。
+
+    高分辨率组合优先，标准分辨率作为回退；同时检查记录清单和底层文件，避免
+    只凭陈旧 artifact 名称调用 SAM3。第三个返回值保留全部候选，供错误响应说明
+    已检查哪些产物。
+    """
     if camera not in ("agentview", "wrist"):
         raise ValueError(f"unknown segment camera: {camera}")
     pairs = [
@@ -1493,6 +1630,7 @@ def _select_segment_artifacts(
 
 
 def _next_segment_index(record: StepRecord) -> int:
+    """返回当前 step 中首个未使用的两位分割产物序号。"""
     idx = 0
     while f"segment_{idx:02d}.json" in record.artifacts:
         idx += 1
@@ -1501,6 +1639,13 @@ def _next_segment_index(record: StepRecord) -> int:
 
 def _mask_to_world(mask: np.ndarray, world_map: np.ndarray,
                    min_valid: int = 10) -> dict:
+    """把布尔分割掩码聚合为稳健的世界坐标估计。
+
+    掩码必须与 ``[H, W, >=3]`` 世界图逐像素同形；函数不会自动缩放，以免插值
+    或行列错位产生看似合理但错误的坐标。过滤非有限值和近零占位点后，至少需要
+    ``min_valid`` 个有效像素，并分别取 XYZ 中位数以减弱边缘深度、遮挡和离群点
+    影响。返回值同时携带像素数与有效点数，便于调用方判断置信度。
+    """
     if world_map.ndim != 3 or world_map.shape[2] < 3:
         return {
             "world_xyz": None,
@@ -1557,6 +1702,10 @@ def _make_segment_overlay(
     image: np.ndarray,
     mask: np.ndarray,
 ) -> np.ndarray | None:
+    """在掩码区域叠加半透明红色，生成不修改原图的诊断图。
+
+    图像与掩码尺寸不一致时返回 ``None``，避免为错误配对的产物制造误导性覆盖图。
+    """
     if image.ndim != 3 or image.shape[:2] != mask.shape:
         return None
     overlay = image.copy()
@@ -1576,7 +1725,12 @@ def view_camera_meta(
     *,
     state: EnvState,
 ) -> dict:
-    """Read camera calibration metadata for localization."""
+    """读取指定 step 的相机标定元数据，用于定位和产物解释。
+
+    主相机标定在 episode 内静态；腕部相机外参随末端运动，返回值因此显式携带
+    实际 ``step``。函数只读取已保存的 ``<camera>_metadata.json``，不会重新查询
+    环境或渲染图像；缺失标定统一返回结构化错误。
+    """
     if camera not in ("agentview", "wrist"):
         return {"error": f"bad camera '{camera}' (use 'agentview' or 'wrist')"}
 
@@ -1608,12 +1762,24 @@ def back_project(
     *,
     state: EnvState,
 ) -> dict:
-    """Look up a pixel's world XYZ in the precomputed world map."""
+    """从预计算世界图反查像素或图像区域对应的世界坐标。
+
+    单像素模式直接索引 ``world_map[row, col]``；标准分辨率下还读取米制深度并
+    验证范围。区域模式要求同时提供半开区间 ``row_range``/``col_range``，先将
+    边界裁到图像范围，再过滤非有限/近零世界点和可选 Z 高度带。其 ``center_xyz``
+    使用有效点 XYZ 包围范围的 XY 中点与 Z 中位数，适合容器空腔或平面区域；
+    ``median_xyz`` 另供稳健比较。
+
+    ``resolution='high'`` 与 ``'low'`` 必须匹配像素来源；主相机和腕部相机也不能
+    混用。函数只消费当前 ``StepRecord`` 的世界图，不执行在线投影、不渲染相机，
+    因而标记为只读。
+    """
     if camera not in ("agentview", "wrist"):
         return {"error": f"bad camera '{camera}' (use 'agentview' or 'wrist')"}
     if resolution not in ("high", "low"):
         return {"error": f"bad resolution '{resolution}' (use 'high' or 'low')"}
 
+    # 任一范围参数出现即进入区域模式；此时单像素 row/col 不参与计算。
     region_mode = row_range is not None or col_range is not None
     if not region_mode and (row is None or col is None):
         return {
@@ -1629,6 +1795,8 @@ def back_project(
         return {"error": f"state step not available: {e}"}
     nn = record.step_idx
 
+    # 直接选择与调用方像素坐标系一致的预计算世界图；不在高低分辨率之间
+    # 自动缩放坐标，以免舍入与方向差异造成静默定位偏差。
     hi_artifact = f"{camera}_world_high.npz"
     low_artifact = f"{camera}_world.npz"
     source_artifact = hi_artifact if resolution == "high" else low_artifact
@@ -1671,6 +1839,8 @@ def back_project(
                     f"rows [{r0},{r1}] cols [{c0},{c1}]"
                 )
             }
+        # 区间按 Python 切片的半开语义裁剪到图像边界；世界图中的非有限值和
+        # 全零占位点先剔除，再施加可选 Z 带，避免背景无效深度影响区域中心。
         window = world_map[r0:r1, c0:c1].reshape(-1, world_map.shape[2]).astype(
             np.float64
         )
@@ -1692,6 +1862,8 @@ def back_project(
                 "n_valid_before_zfilter": n_total,
             }
         xs, ys, zs = pts[:, 0], pts[:, 1], pts[:, 2]
+        # XY 用世界点云包围范围中点表达区域几何中心；Z 使用中位数抵抗边缘和
+        # 遮挡离群值。返回的 median_xyz 让调用方也能查看稳健统计中心。
         center = [
             round(float((xs.min() + xs.max()) / 2.0), 4),
             round(float((ys.min() + ys.max()) / 2.0), 4),
@@ -1726,6 +1898,8 @@ def back_project(
 
     depth_m = None
     if source_artifact == low_artifact:
+        # 标准分辨率会同时保存独立米制深度，可在返回前做物理范围校验；高分辨率
+        # 只持久化世界图以节省空间，因此直接验证其中的 XYZ。
         try:
             depth_artifact = f"{camera}_depth.npz"
             if depth_artifact not in record.artifacts:

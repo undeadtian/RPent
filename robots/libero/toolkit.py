@@ -41,6 +41,18 @@ class LiberoToolkit(Toolkit):
         primitives_kwargs: dict[str, Any],
         dashboard_events: DashboardEventSink,
     ) -> None:
+        """创建单次运行的状态仓库、primitive，并注册 Planner 工具。
+
+        初始化顺序有意固定为：创建独立 ``EnvState`` → 初始化基类通用工具与锁 →
+        reset LIBERO 并保存/发布 step 0 → 注册依赖 primitive 的专属 handler。这样
+        Planner 首次拿到工具列表时，环境、初始 RGB-D 状态和 Dashboard 都已经同步。
+
+        Args:
+            primitives_kwargs: 构造 :class:`LiberoPrimitives` 所需的环境、VLA、SAM3
+                客户端等依赖；取消回调由 Toolkit 自行注入。
+            dashboard_events: 统一的 Dashboard 事件出口；禁用时仍正常保存状态，
+                但跳过单动作视频开销。
+        """
         # 每次运行使用独立 EnvState，根目录由 CLI 初始化的 output_dir 决定。
         state = EnvState(get_output_dir())
 
@@ -53,14 +65,19 @@ class LiberoToolkit(Toolkit):
         self._register_libero_tools()
 
     # ------------------------------------------------------------------
-    # Registration
+    # LIBERO 专属工具注册
     # ------------------------------------------------------------------
     def _register_libero_tools(self) -> None:
-        """把 ``TOOLS_SPEC`` 中的 schema 与实际 Python handler 绑定。
+        """把 ``TOOLS_SPEC`` 的公开 schema 逐项绑定到运行时 handler。
 
-        只读感知工具需要额外绑定本次运行的 ``EnvState``；动作工具则按同名方法
-        直接绑定到 ``LiberoPrimitives``。最终注册表由 Planner 转换为 API tool 或
-        Claude SDK 的进程内 MCP tool。
+        schema 本身只保存 Planner 可见的工具名、描述和 JSON 参数约束。注册时，
+        ``view_env_state``、``view_camera_meta``、``back_project`` 通过 ``partial``
+        注入当前运行的 ``EnvState``，``segment`` 还绑定当前 primitive 的 SAM3 客户端；
+        其余条目按名称查找 :class:`LiberoPrimitives` 方法。找不到实现的 schema 会
+        跳过，避免暴露调用后必然失败的工具。
+
+        :meth:`add_tool` 最终把同一份 schema/handler 对注册到 Planner API 或
+        Claude SDK 进程内 MCP 层；内部 ``state`` 不会出现在公开参数中。
         """
         # 这些 handler 只读取已落盘的状态，不推进模拟器。partial 把当前运行的
         # EnvState 注入进去，使 LLM 的公开参数中不出现内部 state 对象。
@@ -102,13 +119,20 @@ class LiberoToolkit(Toolkit):
         result: dict[str, Any],
         elapsed_s: float,
     ) -> dict[str, Any]:
-        """在状态型工具结束后保存并返回新的可观测环境状态。
+        """在状态型工具结束后持久化观测，并返回 Planner 状态反馈。
 
-        基类 ``Toolkit.execute_tool`` 会为所有非 ``@readonly`` handler 调用本方法。
-        因此 VLA 动作块执行完毕后，Planner 会收到刷新后的主相机/腕部图像、机器人
-        状态、terminated/truncated 标志和工具结果，而不是只看到 primitive 的摘要。
+        基类 :meth:`Toolkit.execute_tool` 会为所有非 ``@readonly`` handler 调用本
+        方法，无论 primitive 成功还是报错。这里先以动作开始前的帧游标截取本次
+        新增帧，再调用 :func:`libero_tools.dump_state` 创建 ``StepRecord``，把 RGB-D、
+        世界图、机器人状态、命令、原始结果和耗时绑定到同一步。
+
+        Dashboard 启用时，新增帧另存为 ``action_<tool>.mp4``；编码失败只记录警告。
+        最后通过 ``view_env_state`` 生成 Planner 所需的文本/图像结果。方法返回后，
+        基类会取得最新 ``StepRecord`` 并调用 ``_publish_step``，依据
+        ``_FRAME_ARTIFACTS`` 发布主相机/腕部帧和状态事件，因此落盘始终先于发布。
         """
-        # 记录本次工具开始前的视频帧游标，用于 Dashboard 生成单动作短视频。
+        # 游标在上次状态采集结束时指向缓冲区尾部；先保存旧值作为本动作起点，
+        # 再推进到当前尾部，使后续动作不会重复包含这些帧。
         frame_start = self._action_frame_cursor
         self._action_frame_cursor = self._primitives.recorded_frame_count()
 
@@ -157,7 +181,13 @@ class LiberoToolkit(Toolkit):
         *,
         primitives_kwargs: dict[str, Any],
     ) -> None:
-        """清空旧产物、创建 primitive、reset 环境并保存初始 step 0。"""
+        """重置运行产物与环境，并建立录制中的初始 step 0。
+
+        清空 ``EnvState`` 后创建 primitive，注入 Toolkit 的取消检查回调；随后 reset
+        远端环境、开启全 episode 录制并把动作片段游标设为当前帧数。初始观测以
+        ``log=None`` 落盘，因此 step 0 没有关联工具命令。primitive 仅在完整记录
+        写入后赋给实例，最后显式发布初始 Dashboard 状态。
+        """
         self._state.reset()
 
         primitives = libero_tools.LiberoPrimitives(
@@ -175,7 +205,13 @@ class LiberoToolkit(Toolkit):
         self._publish_step(record)
 
     def close(self) -> None:
-        """结束录制并把整个 episode 的帧保存为视频。"""
+        """停止录制，并把共享帧时间线保存为完整 episode 视频。
+
+        ``stop_recording`` 会一次性移交并清空 primitive 缓冲区；存在帧时，以固定
+        20 FPS 保存到运行根级 ``episode.mp4``。该视频覆盖 VLA chunk 内每个环境步
+        和脚本化 OSC 的逐步帧，而 Dashboard 单动作短片只是同一缓冲区的切片。
+        关闭阶段属于尽力清理，编码异常只写日志，不能覆盖 Agent 的真实任务结果。
+        """
         try:
             frames = self._primitives.stop_recording()
             if frames:
@@ -187,5 +223,10 @@ class LiberoToolkit(Toolkit):
             )
 
     def write_recipe(self, recipe_tag: str) -> str:
-        """从已保存的状态轨迹导出可复用 LIBERO primitive JSONL。"""
+        """从当前 ``EnvState`` 轨迹导出可复用的 LIBERO primitive recipe。
+
+        实际筛选、排序和 JSONL 保存委托给
+        :func:`libero_tools.write_recipe_from_states`；返回生成的产物名，供上层展示
+        或后续重放。该操作不推进环境。
+        """
         return libero_tools.write_recipe_from_states(self._state, recipe_tag)

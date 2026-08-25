@@ -12,6 +12,12 @@
 主进程随后把去掉 batch 维的动作块交给 ``env.chunk_step`` 执行。把模型放在
 独立进程中有三个目的：模型只加载一次；Agent 主进程不直接依赖 RLinf/OpenPI；
 以及 VLA 服务可以通过 HTTP/socket 部署到远端 GPU。
+
+RPC wire payload 始终保持 JSON-safe：相机帧以 PNG 字节再经 base64 传输，状态
+使用嵌套列表，返回动作则转换为 float32 列表并附带 shape/dtype 元数据。服务启动
+时会先按 ``--cuda-device``（如提供）设置 ``CUDA_VISIBLE_DEVICES``，再在 Facade
+构造阶段延迟导入 RLinf/OpenPI 并加载模型，使进程内的逻辑 ``cuda:0`` 对应命令行
+选择的物理 GPU。
 """
 from __future__ import annotations
 
@@ -65,33 +71,106 @@ def build_model_cfg(model_path: str) -> Any:
     - ``num_images_in_input=2``：策略可使用主相机和腕部相机；
     - ``use_proprio=True``：同时输入机器人本体状态。
 
+    配置分为两层：外层保留 RLinf 通用模型字段，``openpi`` 子表则会覆盖到
+    ``OpenPi0Config``，直接控制当前 Pi0.5 推理实现。两层中的重复值应保持一致，
+    但在当前 ``get_model`` 路径中，动作裁剪、去噪和值头等 OpenPI 行为以子表为准。
+
     返回 OmegaConf 而不是普通 dict，是因为 RLinf 的模型工厂按配置对象读取字段。
     """
     return OmegaConf.create(
         {
+            # -----------------------------------------------------------------
+            # RLinf 通用模型配置层
+            # -----------------------------------------------------------------
+            # 标识模型后端。通用 RLinf 配置/调度代码可据此识别这是 OpenPI 模型；
+            # 本服务已经直接导入 OpenPI get_model，因此不会在这里再次做后端分派。
             "model_type": "openpi",
+
+            # Pi0.5 checkpoint 目录或可由 OpenPI 下载器解析的模型路径。加载器还会
+            # 从该目录读取与训练时一致的归一化统计，不能只指向任意权重文件。
             "model_path": model_path,
+
+            # 不在通用层强制指定 fp16/bf16 等精度。当前加载器按 checkpoint 加载，
+            # 随后将指定模型参数转为其预期的 bfloat16 表示。
             "precision": None,
+
+            # 通用层保留的动作块配置值。当前 OpenPI 返回多少个连续动作，实际由
+            # 下方 openpi.action_chunk 控制；这里保持同值以免其他 RLinf 组件误判。
             "num_action_chunks": 5,
+
+            # LIBERO 环境真正消费的动作维数：XYZ 平移 3 维、旋转 3 维、夹爪 1 维。
+            # OpenPI 内部允许使用带 padding 的更宽动作张量，输出变换只保留前 7 维。
             "action_dim": 7,
+
+            # 不加载 LoRA 适配器，直接使用 checkpoint 中的完整模型权重。
             "is_lora": False,
+
+            # LoRA 的低秩维度；仅在 is_lora=True 时有意义，当前值不会参与推理。
             "lora_rank": 32,
+
+            # 声明策略除图像和语言外还使用机器人本体状态。VLA RPC 的 ``state``
+            # 字段会被转换成 OpenPI observation/state 输入。
             "use_proprio": True,
+
+            # 通用层的采样步数镜像；当前 OpenPI 去噪循环实际读取子表 num_steps。
             "num_steps": 5,
+
+            # 通用层不请求 critic/value head；与子表同名开关保持一致。
             "add_value_head": False,
+
+            # -----------------------------------------------------------------
+            # OpenPI 专属配置层：这些字段覆盖 OpenPi0Config
+            # -----------------------------------------------------------------
             "openpi": {
+                # 选择 Pi0.5 + LIBERO 的模型/数据配置注册项，决定 LIBERO 图像、状态、
+                # prompt、动作反归一化方式以及 checkpoint normalization stats 的布局。
                 "config_name": "pi05_libero",
+
+                # 两路有效视觉输入：第三人称主相机和腕部相机。OpenPI 可保留额外
+                # 图像槽位，但 LIBERO 配置会对不存在的视角做 padding/mask。
                 "num_images_in_input": 2,
+
+                # flow-SDE 采样时的随机扰动强度，参与每步方差计算；选择纯 flow-ODE
+                # 路径时该值不产生随机扩散。数值越大，探索性通常越强、轨迹越随机。
                 "noise_level": 0.5,
+
+                # 每次模型前向最终交给环境执行的连续动作数。模型可以生成更长的
+                # action horizon，但 output_transform 只保留最前面的 5 步。
                 "action_chunk": 5,
+
+                # 从初始噪声积分/去噪到动作的迭代次数。更多步通常增加计算延迟，
+                # 更少步速度更快；该服务固定 5 步以匹配当前 checkpoint 配置。
                 "num_steps": 5,
+
+                # 按“只训练 action expert”的方式构造模型：加载器会冻结 PaliGemma
+                # 视觉语言主干。服务处于 eval 模式，但该标志仍需与 checkpoint 兼容。
                 "train_expert_only": True,
+
+                # 环境有效动作维数，用于 loss/log-prob 等路径只统计前 7 维，忽略
+                # OpenPI 内部 action tensor 为统一模型接口保留的 padding 维度。
                 "action_env_dim": 7,
+
+                # flow 采样器类型。``flow_sde`` 允许按 noise_level 注入随机项；RLinf
+                # 还支持 flow_ode、flow_noise、flow_cps 等路径。
                 "noise_method": "flow_sde",
+
+                # 关闭强化学习 critic/value head；当前服务只需要动作预测结果。
                 "add_value_head": False,
+
+                # 若启用 value head，False 表示从 action-expert suffix 特征估值；
+                # True 才会从 VLM prefix 特征估值。由于值头关闭，本项当前不生效。
                 "value_after_vlm": False,
+
+                # 从 VLM prefix 估值时如何聚合 token；mean_token 表示对选中 token
+                # 求均值。仅在 add_value_head 和 value_after_vlm 同时开启时生效。
                 "value_vlm_mode": "mean_token",
+
+                # 是否在 critic 输入处截断梯度。None 在当前布尔判断中等同未开启；
+                # 且 value head 已关闭，因此不会影响本推理服务。
                 "detach_critic_input": None,
+
+                # 关闭 DSRL 扩展，使用标准 OpenPI flow 动作采样，不创建 DSRL 专用
+                # 图像/状态编码器、Gaussian noise policy 和多 Q-head critic。
                 "use_dsrl": False,
             },
         }
@@ -180,6 +259,14 @@ class VLAFacade(RpcFacade):
     """
 
     def __init__(self, model_path: str):
+        """加载指定 checkpoint 的 Pi0.5，并建立可复用的推理 Facade。
+
+        RLinf/OpenPI 在这里延迟导入，确保调用方已先配置 GPU 可见性。模型仅在服务
+        进程启动时构造一次，后续所有 ``predict`` RPC 共用同一份 CUDA 权重。
+
+        Args:
+            model_path: 本地 Pi0.5 checkpoint 路径，原样写入 RLinf 模型配置。
+        """
         super().__init__()
 
         # 这里延迟导入 RLinf：普通 CLI 参数解析、环境注册和文档构建都不应因为
