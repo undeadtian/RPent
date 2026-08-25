@@ -146,6 +146,24 @@
   .ev .tname { color: var(--accent); font-weight: 600; }
   .ev .tname.err { color: var(--red); }
   .ev .args { color: var(--muted); }
+  .bilingual-block + .bilingual-block {
+    margin-top: 7px; padding-top: 7px; border-top: 1px dashed var(--border);
+  }
+  .bilingual-label {
+    margin-bottom: 2px; color: var(--muted); font-size: 10px;
+    font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+  }
+  .bilingual-content { margin-bottom: 0; }
+  .bilingual-block.lang-zh .bilingual-content { color: var(--fg); }
+  .bilingual-message {
+    padding: 9px 11px; border-left: 2px solid rgba(47,111,214,.35);
+    background: rgba(255,253,248,.5);
+  }
+  .bilingual-message .ev.text { margin: 0; }
+  .ev.thinking .bilingual-block { margin: 5px 0 0; }
+  .ev.thinking .bilingual-block + .bilingual-block { margin-top: 7px; }
+  .tool-line { min-width: max-content; }
+  .tool-line .args { white-space: pre-wrap; }
 
   /* collapsible tool-call group */
   .toolgroup { margin: 6px 0; }

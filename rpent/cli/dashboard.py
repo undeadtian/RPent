@@ -27,6 +27,26 @@ if TYPE_CHECKING:
 
 logger = get_logger("agent")
 
+_BILINGUAL_DASHBOARD_PROMPT = """
+
+DASHBOARD BILINGUAL DISPLAY REQUIREMENT
+The Dashboard language is Simplified Chinese. For every user-visible reasoning
+update and final response, provide both languages in this exact order:
+[EN]
+<concise English text>
+[ZH]
+<faithful Simplified Chinese translation>
+Keep tool names, tool arguments, JSON keys, coordinates, object identifiers,
+and code unchanged. Do not place these markers inside tool arguments. This is a
+display requirement only and must not change tool selection or execution.
+"""
+
+
+def _with_dashboard_language(system_prompt: str, language: str) -> str:
+    if language != "zh-cn":
+        return system_prompt
+    return f"{system_prompt.rstrip()}{_BILINGUAL_DASHBOARD_PROMPT}"
+
 
 def run_dashboard_session(
     args: argparse.Namespace,
@@ -172,9 +192,12 @@ def _run_dashboard_task(
             )
 
             prompt_vars = {**run_config.prompt_vars, "output_dir": output_dir}
-            system_prompt = env_spec.prompts.render(
-                "system",
-                variables=prompt_vars,
+            system_prompt = _with_dashboard_language(
+                env_spec.prompts.render(
+                    "system",
+                    variables=prompt_vars,
+                ),
+                args.dashboard_language,
             )
             user_message = env_spec.prompts.render(
                 "user",

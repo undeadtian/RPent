@@ -121,6 +121,12 @@ const COPY = {
     actionReplayTitle: "Click to replay this action",
     episodeReplayTitle: "Click to replay the full episode",
     thinking: (count) => `thinking · ${count.toLocaleString()} chars`,
+    originalEnglish: "English · original",
+    chineseTranslation: "中文 · 翻译",
+    toolCallOriginal: "Tool call · original",
+    toolCallChinese: "工具调用 · 中文",
+    toolResultOriginal: "Tool result · original",
+    toolResultChinese: "工具结果 · 中文",
     toolCalls: "tool calls",
     eventCount: (count) => `${count} events`,
     actionCaption: (step, action) => `action #${step} ${action}`,
@@ -242,6 +248,12 @@ const COPY = {
     actionReplayTitle: "点击回放该动作",
     episodeReplayTitle: "点击回放完整过程",
     thinking: (count) => `思考 · ${count.toLocaleString()} 字符`,
+    originalEnglish: "English · 原文",
+    chineseTranslation: "中文 · 翻译",
+    toolCallOriginal: "Tool call · 原始调用",
+    toolCallChinese: "工具调用 · 中文说明",
+    toolResultOriginal: "Tool result · 原始结果",
+    toolResultChinese: "工具结果 · 中文说明",
     toolCalls: "次工具调用",
     eventCount: (count) => `${count} 条事件`,
     actionCaption: (step, action) => `动作 #${step} ${action}`,
@@ -685,6 +697,115 @@ function fmtArgs(o) {
   try { return JSON.stringify(o); } catch { return String(o); }
 }
 
+const TOOL_NAMES_ZH = {
+  back_project: "像素反投影",
+  finish: "结束任务",
+  list_dir: "列出目录",
+  move_pose: "移动末端位姿",
+  move_to: "移动末端位置",
+  pi0_doubled: "Pi0 接触操作",
+  pi0_pick: "Pi0 抓取",
+  read_text_file: "读取文本文件",
+  release: "释放物体",
+  rotate_pitch: "调整俯仰角",
+  rotate_wrist: "旋转手腕",
+  segment: "图像分割",
+  set_gripper: "设置夹爪",
+  view_camera_meta: "查看相机参数",
+  view_env_state: "查看环境状态",
+  write_recipe: "写入操作记录",
+};
+
+const TOOL_FIELDS_ZH = {
+  action: "动作",
+  args: "参数",
+  camera_name: "相机名称",
+  chunks: "动作块数",
+  command: "命令",
+  elapsed_s: "耗时（秒）",
+  error: "错误",
+  final_dist_m: "最终距离（米）",
+  final_eef_pos: "最终末端位置",
+  gripper: "夹爪",
+  gripper_closed_thresh: "夹爪闭合阈值",
+  height: "高度",
+  info: "信息",
+  lift_thresh: "抬升阈值",
+  lifted: "是否抬起",
+  max_chunks: "最大动作块数",
+  max_steps: "最大步数",
+  name: "名称",
+  path: "路径",
+  prompt: "提示词",
+  result: "结果",
+  seed: "随机种子",
+  status: "状态",
+  step: "步骤",
+  steps_used: "已用步数",
+  suite: "任务集",
+  target_xyz: "目标坐标",
+  task: "任务",
+  terminated: "任务终止",
+  text: "文本",
+  tol: "容差",
+  traceback: "错误堆栈",
+  truncated: "达到步数限制",
+  width: "宽度",
+  xyz: "三维坐标",
+};
+
+const TOOL_VALUES_ZH = {
+  cancelled: "已取消",
+  completed: "已完成",
+  failed: "失败",
+  false: "否",
+  ok: "正常",
+  pending: "等待中",
+  ready: "就绪",
+  running: "运行中",
+  succeeded: "成功",
+  true: "是",
+};
+
+function translatedToolName(name) {
+  const translated = TOOL_NAMES_ZH[name];
+  return translated ? `${translated} (${name})` : name;
+}
+
+function translateToolDisplay(value) {
+  if (Array.isArray(value)) return value.map(translateToolDisplay);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => {
+      const translatedKey = TOOL_FIELDS_ZH[key];
+      return [translatedKey ? `${translatedKey} (${key})` : key, translateToolDisplay(item)];
+    }));
+  }
+  if (typeof value === "boolean") return TOOL_VALUES_ZH[String(value)];
+  if (typeof value === "string") return TOOL_VALUES_ZH[value.toLowerCase()] || value;
+  return value;
+}
+
+function splitBilingualText(text) {
+  const source = String(text || "");
+  const match = source.match(
+    /^\s*(?:\*\*)?\[EN\](?:\*\*)?\s*\n?([\s\S]*?)\n\s*(?:\*\*)?\[ZH\](?:\*\*)?\s*\n?([\s\S]*?)\s*$/i
+  );
+  if (!match) return { english: source, chinese: "" };
+  return { english: match[1].trim(), chinese: match[2].trim() };
+}
+
+function makeLanguageBlock(label, text, language, makeContent) {
+  const block = document.createElement("div");
+  block.className = `bilingual-block lang-${language}`;
+  const heading = document.createElement("div");
+  heading.className = "bilingual-label";
+  heading.textContent = label;
+  const content = makeContent(text);
+  content.classList.add("bilingual-content");
+  block.append(heading, content);
+  return block;
+}
+
 const interactionController = createInteractionController({
   copy,
   select: $,
@@ -842,17 +963,40 @@ function renderTimeline(
 }
 
 
+function makeToolLine(ev, translated = false) {
+  const line = document.createElement("div");
+  line.className = "tool-line";
+  const arrow = ev.type === "tool_call" ? "→ " : "← ";
+  line.appendChild(document.createTextNode(arrow));
+  const name = document.createElement("span");
+  const isErr = ev.type === "tool_result" && ev.result && ev.result.is_error;
+  name.className = `tname${isErr ? " err" : ""}`;
+  name.textContent = translated ? translatedToolName(ev.tool) : ev.tool;
+  const args = document.createElement("span");
+  args.className = "args";
+  const payload = ev.type === "tool_call" ? ev.args : ev.result;
+  args.textContent = ` ${fmtArgs(translated ? translateToolDisplay(payload) : payload)}`;
+  line.append(name, args);
+  return line;
+}
+
 function makeToolEl(ev) {
   const div = document.createElement("div");
   div.className = "ev " + ev.type;
-  if (ev.type === "tool_call") {
-    div.innerHTML = `→ <span class="tname">${ev.tool}</span> <span class="args"></span>`;
-    div.querySelector(".args").textContent = fmtArgs(ev.args);
-  } else {
-    const isErr = ev.result && ev.result.is_error;
-    div.innerHTML = `← <span class="tname ${isErr ? "err" : ""}">${ev.tool}</span> <span class="args"></span>`;
-    div.querySelector(".args").textContent = fmtArgs(ev.result);
+  if (LANGUAGE !== "zh-cn") {
+    div.appendChild(makeToolLine(ev));
+    return div;
   }
+  const originalLabel = ev.type === "tool_call"
+    ? copy.toolCallOriginal
+    : copy.toolResultOriginal;
+  const translatedLabel = ev.type === "tool_call"
+    ? copy.toolCallChinese
+    : copy.toolResultChinese;
+  div.append(
+    makeLanguageBlock(originalLabel, ev, "en", () => makeToolLine(ev)),
+    makeLanguageBlock(translatedLabel, ev, "zh", () => makeToolLine(ev, true)),
+  );
   return div;
 }
 
@@ -863,11 +1007,46 @@ function makeThinkingEl(ev) {
   const summary = document.createElement("summary");
   const text = ev.text || "";
   summary.textContent = copy.thinking(text.length);
-  const pre = document.createElement("pre");
-  pre.textContent = text;
   details.appendChild(summary);
-  details.appendChild(pre);
+  const bilingual = splitBilingualText(text);
+  const makePre = value => {
+    const pre = document.createElement("pre");
+    pre.textContent = value;
+    return pre;
+  };
+  if (LANGUAGE === "zh-cn" && bilingual.chinese) {
+    details.append(
+      makeLanguageBlock(copy.originalEnglish, bilingual.english, "en", makePre),
+      makeLanguageBlock(copy.chineseTranslation, bilingual.chinese, "zh", makePre),
+    );
+  } else {
+    details.appendChild(makePre(text));
+  }
   div.appendChild(details);
+  return div;
+}
+
+function makeAssistantEl(text) {
+  const bilingual = splitBilingualText(text);
+  if (LANGUAGE !== "zh-cn" || !bilingual.chinese) {
+    return makeAssistantTextElement(text);
+  }
+  const div = document.createElement("div");
+  div.className = "ev text bilingual-message";
+  div.append(
+    makeLanguageBlock(
+      copy.originalEnglish,
+      bilingual.english,
+      "en",
+      makeAssistantTextElement,
+    ),
+    makeLanguageBlock(
+      copy.chineseTranslation,
+      bilingual.chinese,
+      "zh",
+      makeAssistantTextElement,
+    ),
+  );
   return div;
 }
 
@@ -896,7 +1075,7 @@ function appendEvents(events, animateNew = false) {
         if (animateNew) thinking.classList.add("entering");
         box.appendChild(thinking);
       } else if (ev.type === "text") {
-        const text = makeAssistantTextElement(ev.text);
+        const text = makeAssistantEl(ev.text);
         if (animateNew) text.classList.add("entering");
         box.appendChild(text);
       } else {

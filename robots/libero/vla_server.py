@@ -34,6 +34,101 @@ os.environ.setdefault("ROBOT_PLATFORM", "LIBERO")
 # ---------------------------------------------------------------------------
 
 
+def _ensure_openpi_attention_dtype_compatibility() -> None:
+    """Align OpenPI's cached attention tensors with the current query dtype.
+
+    RLinf runs Pi0.5 in bfloat16 but reuses a prefix KV cache whose values can
+    remain float32 with the current OpenPI / Transformers combination. PyTorch
+    matmul requires matching dtypes, so normalize only mismatched cache tensors
+    at the vendored Gemma attention boundary instead of converting the whole
+    model to float32.
+    """
+    from functools import wraps
+
+    from openpi.models_pytorch.transformers_replace.models.gemma import (
+        modeling_gemma,
+    )
+
+    original = modeling_gemma.eager_attention_forward
+    if getattr(original, "_rpent_dtype_compatible", False):
+        return
+
+    @wraps(original)
+    def dtype_compatible_attention(
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        scaling,
+        dropout=0.0,
+        **kwargs,
+    ):
+        if key.dtype != query.dtype:
+            key = key.to(dtype=query.dtype)
+        if value.dtype != query.dtype:
+            value = value.to(dtype=query.dtype)
+        attn_output, attn_weights = original(
+            module,
+            query,
+            key,
+            value,
+            attention_mask,
+            scaling,
+            dropout=dropout,
+            **kwargs,
+        )
+        projection = getattr(module, "o_proj", None)
+        projection_weight = getattr(projection, "weight", None)
+        output_dtype = (
+            projection_weight.dtype
+            if projection_weight is not None
+            else query.dtype
+        )
+        if attn_output.dtype != output_dtype:
+            attn_output = attn_output.to(dtype=output_dtype)
+        return attn_output, attn_weights
+
+    dtype_compatible_attention._rpent_dtype_compatible = True
+    modeling_gemma.eager_attention_forward = dtype_compatible_attention
+
+
+def _ensure_openpi_cache_compatibility(model: Any) -> None:
+    """Prevent suffix denoising steps from growing the shared prefix cache."""
+    import copy
+    from functools import wraps
+
+    original = model.get_suffix_out
+    if getattr(original, "_rpent_cache_compatible", False):
+        return
+
+    @wraps(original)
+    def cache_safe_get_suffix_out(
+        state,
+        prefix_pad_masks,
+        past_key_values,
+        x_t,
+        timestep,
+    ):
+        step_cache = copy.copy(past_key_values)
+        layers = getattr(past_key_values, "layers", None)
+        if layers is not None:
+            # DynamicLayer.update() rebinds keys / values after concatenation,
+            # so shallow layer copies share the immutable prefix tensors but
+            # keep each denoising step's suffix append isolated.
+            step_cache.layers = [copy.copy(layer) for layer in layers]
+        return original(
+            state,
+            prefix_pad_masks,
+            step_cache,
+            x_t,
+            timestep,
+        )
+
+    cache_safe_get_suffix_out._rpent_cache_compatible = True
+    model.get_suffix_out = cache_safe_get_suffix_out
+
+
 def build_model_cfg(model_path: str) -> Any:
     """OmegaConf for ``rlinf.models.embodiment.openpi.get_model``."""
     return OmegaConf.create(
@@ -124,12 +219,14 @@ class VLAFacade(RpcFacade):
 
     def __init__(self, model_path: str):
         super().__init__()
+        _ensure_openpi_attention_dtype_compatibility()
         from rlinf.models.embodiment.openpi import get_model as get_openpi_model
 
         cfg = build_model_cfg(model_path=model_path)
         t0 = time.time()
         logger.info("loading Pi0.5 (model_path=%s) ...", cfg["model_path"])
         self._model = get_openpi_model(cfg, torch_dtype=None).cuda().eval()
+        _ensure_openpi_cache_compatibility(self._model)
         logger.info("model ready in %.1fs", time.time() - t0)
 
     def _dispatch(self, method: str, args: tuple, kwargs: dict) -> Any:

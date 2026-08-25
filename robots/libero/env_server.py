@@ -42,6 +42,33 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
+def _ensure_liberopro_base_compatibility() -> None:
+    """Map LIBERO-PRO's missing robot base to robosuite's null base.
+
+    ``OnTheGroundPanda.default_base`` is ``None``, while robosuite 1.5.2's
+    factory accepts an optional name but tries to call an error string for
+    unregistered values. ``NullBase`` is robosuite's zero-offset, zero-radius
+    base and preserves LIBERO-PRO's intended "no base" semantics.
+    """
+    from robosuite.models.bases import BASE_MAPPING
+
+    if None not in BASE_MAPPING:
+        null_base = BASE_MAPPING.get("NullBase")
+        if null_base is None:
+            raise RuntimeError(
+                "LIBERO-PRO requires robosuite's NullBase for OnTheGroundPanda"
+            )
+        BASE_MAPPING[None] = null_base
+
+
+# rlinf creates LIBERO workers with multiprocessing ``spawn``. A spawned
+# worker executes the server module as ``__mp_main__`` in a fresh interpreter,
+# so it must install the same mapping itself. The parent applies the mapping in
+# ``make_env`` after ``main`` has configured its CUDA / EGL device.
+if __name__ == "__mp_main__":
+    _ensure_liberopro_base_compatibility()
+
+
 def build_env_cfg(
     *,
     task_suite_name: str = "libero_spatial",
@@ -90,6 +117,7 @@ def build_env_cfg(
 def make_env(task_id: int, seed: int, suite_name: str = "libero_spatial",
              max_episode_steps: int = 10000) -> LiberoEnv:
     """Build a single-env LiberoEnv pinned to ``task_id`` / ``seed``."""
+    _ensure_liberopro_base_compatibility()
     from rlinf.envs.libero.libero_env import LiberoEnv
     from rlinf.envs.libero.utils import benchmark as _bench_mod
     suite = _bench_mod.get_benchmark(suite_name)()

@@ -116,18 +116,18 @@ export ANTHROPIC_API_KEY=sk-xxx
 # https://huggingface.co/RLinf/RLinf-Pi05-LIBERO-130-fullshot-SFT
 hf download RLinf/RLinf-Pi05-LIBERO-130-fullshot-SFT \
   --exclude optimizer.pt \
-  --local-dir ./checkpoints/RLinf-Pi05-LIBERO-130-fullshot-SFT
+  --local-dir ./RLinf-Pi05-LIBERO-130-fullshot-SFT
 
-export PI05_CHECKPOINT_PATH=$PWD/checkpoints/RLinf-Pi05-LIBERO-130-fullshot-SFT
+export PI05_CHECKPOINT_PATH=/mnt/nvme1n1/model/rlinf/RLinf-Pi05-LIBERO-130-fullshot-SFT
 
 # SAM 3.0 checkpoint —— 从以下地址下载：
 # https://modelscope.cn/models/facebook/sam3
 pip install -U modelscope
 
 modelscope download facebook/sam3 \
-  --local-dir ./checkpoints/sam3
+  --local-dir ./sam3
 
-export SAM3_CHECKPOINT_PATH=$PWD/checkpoints/sam3/sam3.pt
+export SAM3_CHECKPOINT_PATH=/mnt/nvme1n1/model/rlinf/sam3/sam3.pt
 export LIBERO_TYPE=pro
 
 # 运行一个任务：libero_object_swap，task 2，seed 0，使用 Claude Code
@@ -145,6 +145,21 @@ rpent --env libero --suite libero_object_swap --task 2 --seed 0 \
 ```bash
 rpent --env libero --suite libero_object_swap --task 2 --seed 0 \
   --planner claude_code --model claude-opus-4-8 --interactive
+
+rpent --env libero --planner codex \
+  --model gpt-5.5 \
+  --suite libero_goal_task --task 1 --seed 0
+
+HF_ENDPOINT=https://huggingface.co \
+HF_HUB_DISABLE_XET=1 \
+rpent --env libero \
+  --planner codex \
+  --model gpt-5.6-sol \
+  --dashboard \
+  --dashboard-language zh-cn
+
+/rpent-task libero_goal_task 1 0
+/rpent-task libero_object_swap 2 0
 ```
 
 ### 实时 Dashboard
