@@ -100,7 +100,7 @@ class LiberoToolkit(Toolkit):
             ),
         }
 
-        for spec in libero_tools.TOOLS_SPEC:
+        for spec in libero_tools.TOOLS_SPEC: # 来自rpent/cli/dashboard.py 中的task_primitives_kwargs
             name = spec["name"]
             if name in state_handlers:
                 handler = state_handlers[name]

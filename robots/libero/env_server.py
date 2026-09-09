@@ -54,6 +54,282 @@ if TYPE_CHECKING:
     from rlinf.envs.libero.libero_env import LiberoEnv
 
 
+# =============================================================================
+# env_server 中文导读：进程边界、数据形状与生命周期
+# =============================================================================
+#
+# 一、为什么环境必须放在独立进程
+# ----------------
+# LIBERO 环境会加载 robosuite、MuJoCo、OpenGL/EGL、torch 以及 RLinf 环境封装。这些
+# 组件初始化重、持有原生资源，而且 MuJoCo 渲染后端和 CUDA/EGL 设备必须在首次导入
+# 前确定。把它们放入 env_server 子进程可以：
+#
+# - 让 Planner 主进程不直接持有 MuJoCo / EGL 上下文；
+# - 让每个 TaskRun 拥有独立环境，任务结束时可连同所有原生资源一起回收；
+# - 通过 `--parent-watch` 在父进程 stdin pipe 断开后自动关闭，避免孤儿模拟器；
+# - 使用同一业务协议连接本地 daemon 或用户提供的外部 endpoint。
+#
+# 本文件的顶层导入顺序因此属于功能逻辑，而不只是代码风格：必须先设置 MUJOCO_GL
+# 和 PYOPENGL_PLATFORM，再让任何传递依赖导入 mujoco。指定 `--cuda-device` 时，
+# main() 还必须先完成 EGL 映射和 torch 当前设备选择，最后才调用 make_env() 延迟
+# 导入 LiberoEnv。把这些 import 移到文件顶部可能使渲染后端永久选错。
+#
+# 二、从调用方到模拟器的完整链路
+# ----------------
+#
+#   LiberoEnvClient
+#       │ `env.reset` / `env.step` / `env.chunk_step` / 查询 RPC
+#       ▼
+#   HttpRpcClient 或 SocketRpcClient
+#       │ method + args + kwargs
+#       ▼
+#   RpcFacade.serve()
+#       │ 内建 healthz/shutdown；互斥锁串行化业务 dispatch
+#       ▼
+#   LiberoEnvFacade._dispatch()
+#       │ 仅允许 `env.*` 命名空间
+#       ▼
+#   本类同名方法
+#       │ 单环境形状 <-> RLinf batch-first 形状
+#       ▼
+#   LiberoEnv(num_envs=1) -> robosuite / MuJoCo
+#
+# HTTP 与 socket 只影响 wire 编码，不改变以上业务语义。HTTP 将 NumPy ndarray 编码为
+# `__ndarray__ + dtype + shape + base64(raw bytes)` 的 JSON 标记对象；这里的 base64
+# 内容是数组原始内存，不是 PNG/JPEG。socket 使用长度前缀 pickle，可直接携带 ndarray，
+# 但只适用于可信本地进程。两者都使用 `ok/result` 或 `ok/error/traceback` 响应 envelope。
+# 服务端异常由传输 handler 捕获并带 traceback 返回，客户端统一转换成 RpcError。
+#
+# 三、单环境与 batch-first 形状适配
+# ----------------
+# 调用方只看到普通单环境接口，而 RLinf LiberoEnv 即使 num_envs=1 仍保留环境 batch 维：
+#
+#   客户端 action              [action_dim]
+#       -> _expand_action       [1, action_dim]
+#
+#   客户端 action chunk        [chunk_size, action_dim]
+#       -> _expand_chunk        [1, chunk_size, action_dim]
+#
+#   底层 observation value     [1, ...]
+#       -> _strip/_strip_obs    [...]
+#
+#   底层 chunk term/trunc       [1, chunk_size]
+#       -> _strip               [chunk_size]
+#
+# `_to_numpy_tree()` 在 RPC 边界前递归执行 tensor.detach().cpu().numpy()。因此 GPU
+# tensor、autograd 历史和设备所有权都不会越过进程边界；客户端也无需安装或导入
+# torch。它只负责“类型可传输化”，环境 batch 维由 `_strip*` 单独处理，二者不要混淆。
+#
+# 四、episode 状态机与双层保护
+# ----------------
+# Facade 的 `_done` 是粘滞 episode 标志：
+#
+#   reset 成功 -> _done=False
+#       │
+#       ├─ step/chunk 无结束信号 -> 仍为 False
+#       └─ 任一 terminated/truncated 为真 -> _done=True
+#                                                 │
+#                          后续 step/chunk 在调用底层前被断言拒绝
+#
+# chunk 的信号可能是数组，`_record_done()` 使用 `np.asarray(...).any()`，所以块中任意
+# 时刻结束都会封闭 episode。只有 reset 成功后才清零。客户端还维护自己的 terminated /
+# truncated 粘滞标志，通常能在网络请求前更早拦截；服务端保护则覆盖其他客户端、状态
+# 不同步和直接 RPC 调用。render/raw_obs/camera metadata 等只读查询不受 `_done` 限制，
+# 因为它们不推进模拟器。
+#
+# 五、reset id 与可复现实验
+# ----------------
+# CLI 的 task 是 suite 内任务编号，RLinf 的 `specific_reset_id` 却位于整个 suite 的连续
+# 初始状态空间。make_env() 先累计前序任务状态数，再以 `seed % trials` 选择当前任务
+# 的局部 trial，从而把 `(suite, task, seed)` 稳定映射到一个全局 reset id。配置同时
+# 关闭 auto_reset 并启用 fixed/ordered reset，确保 RPC reset 不会悄悄切换初始场景。
+#
+# 六、服务身份与请求串行化
+# ----------------
+# facade metadata 保存 suite、task、seed 和 max_episode_steps。客户端构造时先调用
+# `env.get_env_meta` 严格比较，确认端口没有连到残留的旧任务，然后才 reset；这是防止
+# “RPC 可用但实验语义错误”的关键检查。
+#
+# HTTP/socket server 可以并发接收连接，但 RpcFacade 用一把业务锁串行执行 `_dispatch`。
+# 这保证 reset、step、chunk_step 和相机查询不会同时触碰非线程安全的 MuJoCo 环境。
+# healthz 无需业务锁；shutdown 会等待正在执行的业务调用离开临界区后再关闭服务。
+# 本类没有单独 close RPC：正常 shutdown、父进程死亡或 ProcessDaemon.stop() 会结束
+# 整个进程，由操作系统和底层析构路径统一回收 MuJoCo/EGL/CUDA 资源。
+
+
+# 七、配置字段逐项说明
+# ----------------
+# `build_env_cfg()` 生成的 OmegaConf 会直接交给 RLinf LiberoEnv。字段按职责可分为：
+#
+# 【环境身份与规模】
+#
+# - env_type="libero"：让 RLinf 选择 LIBERO 环境实现；
+# - task_suite_name：benchmark suite，例如 libero_spatial；
+# - group_size=1：每组只有一个环境，与本服务固定 num_envs=1 对齐；
+# - seed：环境随机种子；具体初始状态还由 specific_reset_id 固定。
+#
+# 【episode 与结束条件】
+#
+# - auto_reset=False：底层发出结束信号后不自动切换 episode，必须显式 RPC reset；
+# - ignore_terminations=False：保留任务成功等 termination 信号；
+# - max_steps_per_rollout_epoch：RLinf rollout 层的最大步数；
+# - max_episode_steps：环境层的 episode 最大步数；
+# - init_params.horizon：传给 robosuite/LIBERO 的 horizon；
+# - is_eval=True：按评估而非训练方式构造环境。
+#
+# 三个最大步数字段使用同一个 CLI 值，避免某一层提前截断而另一层仍认为 episode
+# 可继续。服务端仍同时检查底层返回的 terminated 和 truncated；达到时间上限通常会
+# 通过 truncated 体现，任务成功等语义通常由 terminated 表达，具体值由底层环境决定。
+#
+# 【奖励】
+#
+# - use_rel_reward=False：不切换到相对奖励模式；
+# - use_step_penalty=False：不额外施加逐步惩罚；
+# - reward_coef=1.0：不缩放底层奖励。
+#
+# 本 Facade 不解释、重算或累计奖励，只移除 num_envs=1 的环境维后原样返回客户端。
+#
+# 【reset 与机器人】
+#
+# - reset_gripper_open=True：reset 后使用张开的夹爪初态；
+# - use_fixed_reset_state_ids=True：使用指定 reset state id；
+# - use_ordered_reset_state_ids=True：按确定顺序读取指定状态；
+# - specific_reset_id：`make_env()` 从 task/seed 计算出的 suite 全局状态编号；
+# - init_params.robots：仅当 LIBERO_ROBOT_BASE 环境变量存在时写入，值包装为单元素
+#   列表；否则整个键都不生成，让底层采用默认机器人，而不是传入 None。
+#
+# 【相机与视频】
+#
+# - camera_heights/camera_widths=256：底层常规 observation 相机分辨率；
+# - camera_depths=True：常规观测同时生成深度；
+# - video_cfg.save_video=True：允许底层保存动作/episode 视频；
+# - video_cfg.info_on_video=True：允许把信息叠加到视频；
+# - video_base_dir=/tmp/primitive_videos：底层临时视频目录，不等同于 RPent TaskRun
+#   最终 artifact 目录，上层工具可再搬运或登记产物。
+#
+# `render_camera(height, width)` 可请求不同于常规 256x256 观测的即时分辨率；因此相机
+# metadata 也接受 height/width，调用方应使用与目标图像完全一致的尺寸查询标定数据。
+#
+# 八、Facade 公开 RPC 方法表
+# ----------------
+# RpcFacade 自带 `healthz` 和 `shutdown`；LiberoEnvFacade 只负责 `env.*` 业务方法：
+#
+#   RPC                         输入                              返回
+#   env.get_env_meta            无                                dict
+#   env.reset                   无                                (obs, info)
+#   env.step                    action[action_dim]                五元组
+#   env.chunk_step              actions[T, action_dim],           五元组；obs 或 list[obs]
+#                              return_all_frames: bool
+#   env.raw_obs                 无                                当前 raw obs dict
+#   env.render_camera           camera_name, H, W, depth          ndarray/底层图像结构
+#   env.get_camera_meta         camera_name, H, W                 dict | None
+#   env.get_task_language       无                                str | None
+#   env.cached_image            无                                ndarray | None
+#
+# `env.reset`、`env.step` 和 `env.chunk_step` 会改变环境状态；其余 `env.*` 方法均为
+# 查询。render_camera 虽然可能触发昂贵的 EGL 渲染，但不增加 episode step。raw_obs
+# 读取 LiberoEnv 保存的 current_raw_obs；cached_image 读取 `_cached_full_image` 私有
+# 缓存，两者都不保证在首次 reset 之前已有有效值，不过客户端构造时会自动 reset。
+#
+# `_dispatch()` 根据前缀截出属性名并调用 Facade 自身，而不是把任意方法直接转发给
+# `self._env`。例如 `env.step` 命中本类的 step 适配层，客户端不能借 RPC 任意访问
+# LiberoEnv 内部属性。非 `env.*` 名称由本类拒绝；healthz/shutdown 已在 RpcFacade
+# 外层提前截获，不会进入这里。
+#
+# 九、reset / step / chunk_step 精确数据流程
+# ----------------
+# 【reset】
+#
+#   self._env.reset()
+#       -> obs_batch, info
+#       -> _to_numpy_tree(obs_batch)       # tensor/GPU -> NumPy/CPU
+#       -> _strip_obs(...)                 # 每个观测值 [1,...] -> [...]
+#       -> _done=False                     # 仅在前述操作成功后清零
+#       -> 返回 obs, numpy_info
+#
+# 如果底层 reset 或观测转换抛错，`_done=False` 这一赋值不会执行。异常经统一 RPC error
+# envelope 返回，客户端的 reset 也只在 RPC 成功后清除本地结束标志，两端保持一致。
+#
+# 【单步 step】
+#
+#   检查 _done=False
+#       -> np.asarray(action)[None]         # [A] -> [1,A]
+#       -> self._env.step(...)
+#       -> obs 转 CPU NumPy并逐键去环境维
+#       -> reward/term/trunc 转 NumPy并取索引 0
+#       -> _record_done(term, trunc)
+#       -> 返回 obs, reward, term, trunc, info
+#
+# info 只递归转换，不调用 `_strip`，因为它的嵌套结构由 RLinf 定义，不应假设顶层一定
+# 是环境 batch。reward、term、trunc 明确遵循 batch-first 契约，所以安全取唯一索引。
+#
+# 【动作块 chunk_step】
+#
+#   检查 _done=False
+#       -> actions[T,A][None]               # [T,A] -> [1,T,A]
+#       -> self._env.chunk_step(...)
+#       -> 对 obs_list 中每一时刻的观测逐键去环境维
+#       -> reward/term/trunc 去掉首个环境维
+#       -> term/trunc 中任一元素为真即置 _done=True
+#       -> return_all_frames ? obs_list : obs_list[-1]
+#
+# Facade 假设底层 chunk_step 至少返回一帧，因为 `return_all_frames=False` 会访问
+# `obs_list[-1]`。动作块长度与动作维度的合法性由底层 LiberoEnv 校验；本适配层只增加
+# 环境维，不静默 reshape、裁剪或填充错误动作。
+#
+# 十、转换函数的边界与注意事项
+# ----------------
+# `_to_numpy_tree()` 递归处理 dict/list/tuple，并保持这些容器的类型；非 torch tensor
+# 对象原样返回。它不是通用 JSON 编码器：真正的 ndarray JSON/base64 编码发生在
+# HttpRpcServer；socket 则由 pickle 处理。分层顺序为：
+#
+#   GPU tensor -> CPU ndarray -> HTTP JSON 标记 / socket pickle -> 客户端 ndarray
+#
+# tensor 的 `.detach()` 表明该 RPC 是推理/环境边界，不传播梯度；`.cpu()` 可能引发
+# GPU 同步和数据复制，因此大图像调用的耗时包含这部分成本。NumPy 输入不会额外复制，
+# 除非后续 HTTP 解码端为可写数组建立副本。
+#
+# `_strip(v)` 只做 `v[0]`，不会判断形状，也不会递归。该简单约定依赖两个构造不变量：
+# LiberoEnv 使用 num_envs=1，且被 strip 的值确实含环境维。若底层 RLinf 接口改变返回
+# 形状，应在这里显式适配，而不是让错误索引产生表面合法但语义错误的数据。
+#
+# 十一、CLI 参数与进程生命周期
+# ----------------
+#
+# - `--transport`：http 或 socket，默认 http；
+# - `--host` / `--port`：监听地址；port=0 让操作系统选择端口；
+# - `--suite` / `--task` / `--seed`：共同决定任务和 reset 状态；
+# - `--max-episode-steps`：同步写入三层 horizon 配置，并进入 metadata；
+# - `--cuda-device`：物理 CUDA ordinal，用于 EGL 映射和 torch 当前设备；
+# - `--parent-watch`：监听 stdin EOF；父 ProcessDaemon 退出时触发服务 shutdown。
+#
+# 普通 RPent 运行不会依赖 port=0 后再解析日志，而是在父进程先选一个本地端口并显式
+# 传入。服务构造顺序是：解析参数 -> 可选清除 CUDA_VISIBLE_DEVICES -> 配置 EGL ->
+# 导入/设置 torch -> 延迟构造 LiberoEnv -> 构造 metadata Facade -> 开始 serve。
+# `serve()` 只有在环境构造成功后才绑定业务服务，因此 healthz ready 同时意味着环境
+# 对象已成功创建，但不代表某次 reset/step 永远不会因场景数据或运行时资源失败。
+#
+# 十二、错误传播和可恢复边界
+# ----------------
+# Facade 方法不吞掉环境异常。`_dispatch()` 记录 warning 后重新抛出，传输层返回错误
+# 文本和服务端 traceback；LiberoEnvClient 最终收到 RpcError。典型错误包括：
+#
+# - 环境资产、benchmark 或 reset state 加载失败；
+# - EGL/CUDA 设备初始化或渲染失败；
+# - 动作 shape/数值不被底层接受；
+# - episode 结束后再次 step/chunk；
+# - 未知 RPC 名称或参数不匹配；
+# - 返回对象无法转换或序列化。
+#
+# RPC 超时与明确的远端错误不同：超时时客户端无法仅凭响应确认远端方法是否已经执行。
+# 对会推进环境的 step/chunk 不应盲目重试；RPent 的安全恢复方式通常是终止该 TaskRun
+# 拥有的 env_server，并在新进程中重新构造环境。查询类 RPC 可由上层按需求重试。
+#
+# `assert not self._done` 是运行期协议保护，但 Python `-O` 会移除 assert；当前 RPent
+# 服务按普通解释模式启动。客户端还有一层粘滞结束检查，底层 LiberoEnv 也可能拒绝
+# 非法推进。这里的双层检查用于尽早暴露调用错误，不替代上层对终止状态的正常处理。
+
+
 # ---------------------------------------------------------------------------
 # 环境配置与构造
 # ---------------------------------------------------------------------------

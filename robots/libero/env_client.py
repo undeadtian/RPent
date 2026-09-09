@@ -17,6 +17,89 @@ import numpy as np
 
 from rpent.utils.rpc import RpcClient
 
+# =============================================================================
+# env_client 中文导读：轻量代理、协议契约与本地防护
+# =============================================================================
+#
+# 一、客户端不运行模拟器
+# ----------------
+# LiberoEnvClient 是传输无关的领域代理：它只依赖满足 RpcClient Protocol 的对象，
+# 不导入 LIBERO、robosuite、MuJoCo 或 torch。HttpRpcClient 和 SocketRpcClient 都可
+# 注入，公开方法及返回结构不随传输变化。真正的动作扩维、观测去 batch 维、tensor
+# 转 NumPy 和环境推进都发生在 env_server 进程。
+#
+#   调用代码 -> LiberoEnvClient -> RpcClient.call -> env_server -> LiberoEnv
+#
+# `RpcClient.call(method, args, kwargs, timeout_s)` 成功时已经解包服务端 `result`；远端
+# 业务异常、非法响应或传输失败会统一抛 RpcError。因此本类无需处理 HTTP 状态码、
+# JSON/base64、socket frame 或服务端 traceback envelope。
+#
+# 二、公开 RPC 契约
+# ----------------
+#
+#   客户端方法                 远端方法                    是否推进环境
+#   reset()                    env.reset                   是（开始新 episode）
+#   step(action)               env.step                    是（一步）
+#   chunk_step(actions)        env.chunk_step              是（一个动作块）
+#   raw_obs()                  env.raw_obs                 否
+#   render_camera(...)         env.render_camera           否
+#   get_camera_meta(...)       env.get_camera_meta         否
+#   get_task_language()        env.get_task_language       否
+#   cached_image()             env.cached_image            否
+#
+# reset 返回 `(obs, info)`；step 与 chunk_step 固定返回 Gym 风格五元组
+# `(obs, reward, terminated, truncated, info)`。chunk_step 在
+# `return_all_frames=True` 时第一项为逐步观测列表，否则为最后一帧观测；这个选择只
+# 改变第一项，不改变五元组其余位置。
+#
+# 客户端发送单环境形状：action 为 `[action_dim]`，动作块为
+# `[chunk_size, action_dim]`。收到的观测已去掉底层 num_envs=1 的前导环境维，所有
+# tensor 也已由服务端变为 CPU NumPy。客户端刻意不再次转换，以保持服务端协议原貌。
+#
+# 三、构造函数有网络和环境副作用
+# ----------------
+# `LiberoEnvClient(...)` 不是纯字段初始化。它按以下顺序同步执行：
+#
+#   1. 调用 env.get_env_meta；
+#   2. 与 expected_meta 做严格字典相等比较；
+#   3. 只有匹配后才调用 reset；
+#   4. reset 成功后实例才返回给调用方。
+#
+# 因此构造成功意味着：endpoint 可调用、suite/task/seed/horizon 与调用方一致，而且
+# 远端已进入新 episode。若 metadata 不一致，必须拒绝 reset，以免误改一个不属于当前
+# TaskRun 的旧环境。严格相等还会发现客户端/服务端协议版本导致的字段增删，而不仅是
+# 值不同。
+#
+# 四、客户端与服务端的双层 episode 防护
+# ----------------
+# `terminated` 和 `truncated` 是两个独立的粘滞布尔值：
+#
+#   reset 成功 -> 两者均 False
+#       │
+#       └─ step/chunk 返回信号 -> 分别 OR 到已有状态
+#
+# `check_done()` 对标量或数组统一执行 `np.asarray(...).any()`；因此动作块中任一位置
+# 出现结束都会保留。后续 step/chunk 在发 RPC 前断言失败，避免无意义的网络请求。
+# env_server 还维护自己的 `_done`，即使另一个调用方绕过本客户端，也不能推进已经结束
+# 的 episode。reset 的本地清零发生在 RPC 成功之后：远端超时或失败不会制造“客户端
+# 以为新 episode 已开始、服务端其实没有”的假状态。
+#
+# 五、超时为何按方法区分
+# ----------------
+# `_TIMEOUT_S` 是请求完成上限，不是 episode horizon。metadata、raw_obs 和轻量查询
+# 使用 default；reset 可能创建/重置仿真；step 可能包含渲染；chunk_step 执行多动作；
+# 高分辨率 render_camera 还可能触发 EGL/GPU 同步，因此后三类需要更宽裕的超时。
+# 超时不代表远端一定已经停止执行：调用方不应在不确认环境状态的情况下盲目重发 step，
+# 否则可能重复推进。正常运行由上层 TaskRun 生命周期在失败时关闭并重建 env_server。
+#
+# 六、查询方法与缓存图像
+# ----------------
+# raw_obs 返回底层当前观测，render_camera 请求一次指定尺寸的即时渲染，cached_image
+# 则只读取底层最近缓存，不触发新渲染；后二者语义不同。get_camera_meta 的 height /
+# width 应与要解释的图像分辨率一致，调用方才能正确反投影。所有查询都不修改本地
+# terminated/truncated，但仍可能因 endpoint 不可达、远端解码或底层渲染失败而抛
+# RpcError。
+
 # 不同 RPC 的耗时差异很大：reset、动作块和高分辨率渲染需要比轻量查询更宽裕的
 # 超时。键名与实际发出的 RPC 名称保持一致，便于逐接口审查超时策略。
 _TIMEOUT_S = {
